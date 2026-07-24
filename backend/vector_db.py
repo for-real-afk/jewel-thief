@@ -1,0 +1,60 @@
+"""
+Pinecone vector database: index setup, batch upsert, filtered ANN search.
+"""
+from pinecone import Pinecone, ServerlessSpec
+
+from config import get_settings
+from utils import external_api_retry
+
+settings = get_settings()
+_pc = Pinecone(api_key=settings.pinecone_api_key)
+
+
+def get_or_create_index():
+    existing = [idx["name"] for idx in _pc.list_indexes()]
+    if settings.pinecone_index_name not in existing:
+        _pc.create_index(
+            name=settings.pinecone_index_name,
+            dimension=settings.embedding_dimensions,
+            metric="cosine",
+            spec=ServerlessSpec(cloud=settings.pinecone_cloud, region=settings.pinecone_region),
+        )
+    return _pc.Index(settings.pinecone_index_name)
+
+
+def upsert_batch(items: list[dict]) -> int:
+    """
+    items: [{"id": str, "vector": list[float], "metadata": {...}}, ...]
+    Batches in chunks of 100 (Pinecone's recommended upsert batch size).
+    """
+    index = get_or_create_index()
+    count = 0
+    for i in range(0, len(items), 100):
+        chunk = items[i:i + 100]
+        vectors = [(item["id"], item["vector"], item["metadata"]) for item in chunk]
+        index.upsert(vectors=vectors)
+        count += len(chunk)
+    return count
+
+
+@external_api_retry
+def search(
+    query_vector: list[float],
+    top_k: int | None = None,
+    metadata_filter: dict | None = None,
+) -> list[dict]:
+    """
+    ANN search with optional metadata filtering (price range, category, material).
+    Returns raw Pinecone matches: [{"id", "score", "metadata"}, ...]
+    """
+    index = get_or_create_index()
+    result = index.query(
+        vector=query_vector,
+        top_k=top_k or settings.top_k,
+        include_metadata=True,
+        filter=metadata_filter or {},
+    )
+    return [
+        {"id": m["id"], "score": m["score"], "metadata": m.get("metadata", {})}
+        for m in result["matches"]
+    ]

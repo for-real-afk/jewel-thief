@@ -1,0 +1,31 @@
+# Secrets — never commit real environment files, only the .example templates
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Node / frontend build output
+node_modules/
+dist/
+
+# Runtime-generated / fetched data — regenerate via backend/scripts/*.py,
+# or created automatically by the app on first run. Not source.
+backend/static/catalog/
+backend/catalog_store.json
+backend/sample_data/
+
+# Logs
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db

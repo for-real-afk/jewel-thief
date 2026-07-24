@@ -1,0 +1,107 @@
+/* Shared design tokens for the whole app (chat page + catalog admin page).
+   Previously these lived only inside App.jsx's own <style> tag, which meant
+   they didn't exist on any route that doesn't render <App>. Extracted here
+   and imported once in main.jsx so every route gets the same tokens. */
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=Inter:wght@400;500;600&display=swap');
+
+:root {
+  --bg: #FAF8F5;
+  --surface: #FFFFFF;
+  --ink: #17161A;
+  --ink-soft: #6E6B66;
+  --hairline: #E8E4DC;
+  --gold-1: #8C6B32;
+  --gold-2: #C9A15A;
+  --gold-3: #F1DFB8;
+  --gradient: linear-gradient(120deg, var(--gold-1), var(--gold-2) 45%, var(--gold-3) 70%, var(--gold-2));
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Inter', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+/* Shared page shell — every route (chat page, catalog admin page) renders
+   this same wrapper/header structure, so it lives here rather than inside
+   whichever page component happens to be mounted (a route's own <style>
+   tag only exists in the DOM while that route is mounted). */
+.app-shell {
+  font-family: 'Inter', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.header {
+  width: 100%;
+  max-width: 760px;
+  padding: 28px 20px 14px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.wordmark {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  background: var(--gradient);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.facet-line {
+  width: 46px;
+  height: 1px;
+  background: var(--gradient);
+  margin-top: 10px;
+}
+
+.shimmer-line {
+  width: 120px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--gold-2), transparent);
+  background-size: 200% 100%;
+  animation: shimmer 1.3s linear infinite;
+}
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-line { animation: none; background: var(--gold-2); }
+}
+
+/* Shared minimal nav between the chat page and the catalog admin page */
+.top-nav {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  gap: 22px;
+  padding: 14px 20px 0;
+  font-size: 12.5px;
+}
+.top-nav a {
+  color: var(--ink-soft);
+  text-decoration: none;
+  padding-bottom: 3px;
+  border-bottom: 1px solid transparent;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.top-nav a:hover {
+  color: var(--ink);
+}
+.top-nav a.active {
+  color: var(--ink);
+  border-bottom-color: var(--gold-2);
+}
