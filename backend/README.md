@@ -128,41 +128,65 @@ Admin polls GET /api/v1/catalog/jobs/{job_id} every 2s until status is
 "done" (partial failures still count as done) or "failed" (every item failed)
 ```
 
-### 3.2 Search (querying with a photo)
+### 3.2 Search (querying with a photo or a text description)
+
+`POST /api/v1/search` accepts exactly one of two inputs — a multipart `image` file, or
+a `query_text` form field — never both, never neither (both return `400`, see the exact
+messages in `main.py::search`). Whichever one is provided decides everything downstream
+via a `query_type: "image" | "text"` field echoed back on `SearchResponse`, but **both
+paths converge on the same Pinecone index and the same 768-dim vector space** — see §4.2
+for why that's possible without a second embedding pipeline.
 
 ```text
-User uploads a reference photo (chat page, or POST /api/v1/search directly)
-  │
-  ▼
-preprocessing.prepare_image_bytes()  — same normalization as indexing;
-  query and catalog images MUST go through the identical pipeline, or
-  systematic differences (crop, scale) would bias similarity scores
-  │
-  ▼
-embeddings.embed_query_image()  — gemini-embedding-2, task_type="RETRIEVAL_QUERY"
-  │
-  ▼
-vector_db.search()  — Pinecone ANN query, top_k=20 by default, optional
-  metadata filter ({"category": {"$eq": ...}}, {"price": {"$gte"/"$lte": ...}})
-  │
-  ▼
-Filter to matches with score >= MIN_SIMILARITY_THRESHOLD (0.55 default) —
-  BEFORE reranking, specifically to avoid spending an LLM call on weak
-  candidates that were never going to be shown. If nothing clears the bar,
-  return no_match=True immediately; reranker.rerank() is never called.
-  │
-  ▼
-reranker.rerank()  — single batched LLM call judging ALL surviving
-  candidates at once (not one call per candidate — keeps latency/cost
-  roughly constant regardless of K). Returns each candidate enriched with
-  confidence (high/medium/low) + a one-line reason, sorted by
-  (confidence tier, then cosine score) — see §6 for why this sort order
-  is a live design tradeoff, not a settled decision.
-  │
-  ▼
-SearchResponse: {query_id, no_match, matches: [{id, similarity_percent,
-  confidence, reason, metadata}]}  — similarity_percent is the REAL cosine
-  score * 100, never an LLM-invented number (see §6)
+                    image                                    query_text
+                      │                                           │
+                      ▼                                           ▼
+  preprocessing.prepare_image_bytes()          text = query_text.strip()  (blank
+    — same normalization as indexing;            after stripping is treated as
+    query and catalog images MUST go             "not provided" → 400, same as
+    through the identical pipeline, or            omitting the field entirely)
+    systematic differences (crop, scale)                          │
+    would bias similarity scores                                  │
+                      │                                            │
+                      ▼                                            ▼
+  embeddings.embed_query_image()              embeddings.embed_text_query()
+    gemini-embedding-2,                          gemini-embedding-2,
+    task_type="RETRIEVAL_QUERY"                  task_type="RETRIEVAL_QUERY"
+                      │                                            │
+                      └─────────────────────┬──────────────────────┘
+                                             ▼
+                      vector_db.search()  — Pinecone ANN query against the SAME
+                        index the catalog was indexed into (top_k=20 by default),
+                        optional metadata filter ({"category": {"$eq": ...}},
+                        {"price": {"$gte"/"$lte": ...}}) — identical for both paths
+                                             │
+                                             ▼
+                      Filter to matches with score >= MIN_SIMILARITY_THRESHOLD
+                        (0.55 default) — BEFORE reranking, to avoid spending an
+                        LLM call on weak candidates that were never going to be
+                        shown. If nothing clears the bar, return no_match=True
+                        immediately; reranker.rerank() is never called.
+                                             │
+                                             ▼
+                      reranker.rerank(query, candidates)  — query is
+                        {"type": "image", "bytes": ...} or {"type": "text",
+                        "text": ...}. Single batched LLM call judging ALL
+                        surviving candidates at once. The image path judges
+                        visual traits it can see in the reference photo; the
+                        text path has no image to show the model, so it judges
+                        each candidate's stated metadata (name/category/
+                        material/caption/description/tags) against the query's
+                        terms instead — see §6 for both prompt shapes. Returns
+                        each candidate enriched with confidence (high/medium/
+                        low) + a one-line reason, sorted by (confidence tier,
+                        then cosine score) — see §6 for why this sort order is
+                        a live design tradeoff, not a settled decision.
+                                             │
+                                             ▼
+                      SearchResponse: {query_id, no_match, query_type,
+                        matches: [{id, similarity_percent, confidence, reason,
+                        metadata}]}  — similarity_percent is the REAL cosine
+                        score * 100, never an LLM-invented number (see §6)
 ```
 
 ---
@@ -208,6 +232,17 @@ catalog items — this is an *asymmetric* retrieval convention (the query and th
 being retrieved are embedded slightly differently on purpose, to optimize for "find
 documents relevant to this query" rather than "find documents identical to this
 query"). This vector is a direct function of pixel content — not a description of it.
+
+**Text search reuses the exact same model and space.** Because `gemini-embedding-2` is
+natively multimodal — not a text model and an image model bolted together — a plain
+string handed to `embed_content()` lands in the *same* 768-dim space as the image
+vectors, using the same `RETRIEVAL_QUERY` task type (`embeddings.py::embed_text_query`).
+No second Pinecone index, no second embedding call path with different dimensions, no
+provider switch: a text query is compared against the catalog's image-derived vectors
+directly. This is *not* a caption-then-embed workaround (the kind removed in §4.3/
+[ISSUES.md §2.2](../ISSUES.md#22-no-local-model-can-embed-images-directly)) — no
+intermediate text description of any catalog image is ever generated or stored; only
+the *query* is text, and it's embedded once, directly, by the same multimodal model.
 
 **Why not a local/offline option too?** One was built and tested: a caption-then-embed
 workaround (a local vision model describes the image in one sentence, a local
@@ -272,8 +307,31 @@ entire catalog**, not just switching the setting for future queries.
 
 The reranker exists because raw cosine similarity alone doesn't capture everything a
 human would notice — it can rank two items close in embedding space that differ in a
-way a shopper would care about, or vice versa. `reranker.py::rerank()`:
+way a shopper would care about, or vice versa. `reranker.py::rerank(query, candidates)`:
 
+0. **Takes a `query` dict, not raw bytes**, because a search can be an image or a text
+   description (§3.2): `{"type": "image", "bytes": <jpeg bytes>}` or `{"type": "text",
+   "text": <query string>}`. This branches which prompt template is used and what the
+   LLM is asked to judge, while JSON parsing, the malformed-response fallback, and
+   sorting stay identical for both:
+   - **Image query** (`_IMAGE_PROMPT_TEMPLATE`): the reference photo is sent as an
+     actual multimodal `Part` alongside the prompt. The LLM reasons about what it can
+     literally *see* — gemstone cut, metal color/finish, chain or band pattern,
+     silhouette — against a deliberately narrow metadata slice (`name`/`category`/
+     `material` only; see the token-budget note below).
+   - **Text query** (`_TEXT_PROMPT_TEMPLATE`): there is no image to send — the prompt
+     contains only the query string and each candidate's metadata. The LLM is
+     explicitly instructed to judge only whether the *stated* metadata (now widened to
+     `name`/`category`/`material`/`caption`/`description`/`tags`, since those are the
+     only place a searched-for color/material term could actually appear) matches the
+     query's terms, and told **not** to invent or assume visual details it has no way
+     to observe from text alone — this guards against the model fabricating a
+     "gemstone cut" judgment it never actually saw.
+   - Dropping the image entirely for text queries removes the single largest token
+     cost in the image path (the real contributor to a production Groq TPM error, see
+     `utils.py`'s `_CHAT_MAX_TOKENS` comment) — which should more than offset the wider
+     metadata block, but this has **not been empirically measured** against Groq's rate
+     limit the same way the image path now has been (§11).
 1. **Never invents a percentage.** The design docstring says it directly: an LLM asked
    for "94.3% match" is producing a plausible-looking number it has no calibrated way to
    compute. The percentage shown to users (`similarity_percent`) is always the *real*
@@ -450,3 +508,12 @@ python scripts/smoke_test.py
 - `BackgroundTasks` (stdlib, in-process) is fine at this scale; swap for a real queue
   (Celery/RQ/Cloud Tasks) before indexing volume grows large enough that a backend
   restart mid-batch becomes a real operational risk.
+- **Text-query embedding quality is unmeasured.** `embed_text_query()` (§3.2, §4.2)
+  relies on `gemini-embedding-2` correctly encoding color/material/style terms into a
+  space that's meaningfully comparable to the catalog's pixel-only image embeddings —
+  this is architecturally sound (same model, same space, documented asymmetric
+  retrieval convention) but, same as the `gemini-2.5-flash` reranker caveat above, was
+  **not live-tested against real catalog data this session**. Before trusting text
+  search for real merchandising decisions, run real queries ("gold pink enamel
+  earrings") against a real indexed catalog and check whether the top results are
+  actually relevant, not just whether the endpoint returns 200.

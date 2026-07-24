@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +81,7 @@ class SearchResponse(BaseModel):
     query_id: str
     matches: list[MatchResult]
     no_match: bool
+    query_type: Literal["image", "text"]
 
 
 class IndexResponse(BaseModel):
@@ -152,21 +153,47 @@ def health():
 
 @app.post("/api/v1/search", response_model=SearchResponse, dependencies=[])
 async def search(
-    image: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),
+    query_text: Optional[str] = Form(None),
     category: Optional[str] = Form(None),
     max_price: Optional[float] = Form(None),
     min_price: Optional[float] = Form(None),
     x_api_key: Optional[str] = Header(None),
 ):
+    """
+    Accepts EITHER an image OR a text query, never both — the two paths
+    share the same Pinecone index and the same embedding model
+    (gemini-embedding-2 is natively multimodal: text and images already
+    live in one comparable vector space, so a text query just needs
+    task_type="RETRIEVAL_QUERY" like an image query does, not a separate
+    pipeline). Everything downstream of embedding — metadata filtering,
+    vector_db.search, the similarity threshold, reranking — is identical
+    regardless of which input type was used.
+    """
     require_api_key(x_api_key)
 
-    raw_bytes = await image.read()
-    try:
-        clean_bytes = prepare_image_bytes(raw_bytes)
-    except InvalidImageError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    has_image = image is not None
+    text = (query_text or "").strip()
+    has_text = bool(text)
 
-    query_vector = embeddings.embed_query_image(clean_bytes)
+    if not has_image and not has_text:
+        raise HTTPException(status_code=400, detail="Provide either an image or a text query.")
+    if has_image and has_text:
+        raise HTTPException(status_code=400, detail="Provide only one of image or text query, not both.")
+
+    if has_image:
+        raw_bytes = await image.read()
+        try:
+            clean_bytes = prepare_image_bytes(raw_bytes)
+        except InvalidImageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        query_vector = embeddings.embed_query_image(clean_bytes)
+        query_type: Literal["image", "text"] = "image"
+        rerank_query = {"type": "image", "bytes": clean_bytes}
+    else:
+        query_vector = embeddings.embed_text_query(text)
+        query_type = "text"
+        rerank_query = {"type": "text", "text": text}
 
     metadata_filter: dict = {}
     if category:
@@ -185,13 +212,14 @@ async def search(
     strong_matches = [m for m in raw_matches if m["score"] >= settings.min_similarity_threshold]
 
     if not strong_matches:
-        return SearchResponse(query_id=str(uuid.uuid4()), matches=[], no_match=True)
+        return SearchResponse(query_id=str(uuid.uuid4()), matches=[], no_match=True, query_type=query_type)
 
-    ranked = reranker.rerank(clean_bytes, strong_matches)
+    ranked = reranker.rerank(rerank_query, strong_matches)
 
     return SearchResponse(
         query_id=str(uuid.uuid4()),
         no_match=False,
+        query_type=query_type,
         matches=[
             MatchResult(
                 id=m["id"],

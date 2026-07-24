@@ -48,6 +48,27 @@ def embed_query_image(image_bytes: bytes) -> list[float]:
     return embed_image(image_bytes, task_type="RETRIEVAL_QUERY")
 
 
+@external_api_retry
+def embed_text_query(text: str) -> list[float]:
+    """Embed a natural-language search query into the SAME vector space as
+    catalog images. gemini-embedding-2 is natively multimodal — text and
+    images already share one 768-dim space, so a text query embedded with
+    RETRIEVAL_QUERY is directly comparable against the catalog's
+    RETRIEVAL_DOCUMENT image vectors with no separate index or provider
+    needed. Whether the model actually encodes material/color terms (e.g.
+    "pink enamel") close enough to matching catalog images in that shared
+    space hasn't been measured — see README.md's Known Limitations."""
+    response = _client.models.embed_content(
+        model=settings.embedding_model,
+        contents=text,
+        config=types.EmbedContentConfig(
+            output_dimensionality=settings.embedding_dimensions,
+            task_type="RETRIEVAL_QUERY",
+        ),
+    )
+    return response.embeddings[0].values
+
+
 def embed_catalog_image(image_bytes: bytes) -> list[float]:
     """Convenience wrapper for a catalog item being indexed."""
     return embed_image(image_bytes, task_type="RETRIEVAL_DOCUMENT")

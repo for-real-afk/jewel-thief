@@ -26,7 +26,9 @@ settings = get_settings()
 # A ~20-item {id, confidence, reason} JSON array response realistically
 # needs a few hundred tokens; 2048 leaves generous headroom without
 # needlessly inflating the requested-token count that gates the limit.
-_VISION_CHAT_MAX_TOKENS = 2048
+# Shared by both the vision (image attached) and text-only chat calls below
+# — it bounds the response, which has the same shape either way.
+_CHAT_MAX_TOKENS = 2048
 
 # preprocessing.py caps catalog/query images at 1024x1024 for embedding
 # quality, but a vision-chat *judge* call doesn't need that much resolution
@@ -46,31 +48,35 @@ def _downscale_for_vision_api(image_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
-def _openai_compatible_vision_chat(
+def _openai_compatible_chat(
     base_url: str,
     model: str,
-    image_bytes: bytes,
     prompt: str,
     timeout: int,
+    image_bytes: bytes | None = None,
     headers: dict | None = None,
     extra_params: dict | None = None,
 ) -> str:
-    """Single-turn vision chat against an OpenAI-compatible /chat/completions
-    endpoint. Only Groq uses this now, but kept as a named function separate
-    from groq_vision_chat since it's a generically useful request shape, not
-    a Groq-specific one."""
-    b64 = base64.b64encode(_downscale_for_vision_api(image_bytes)).decode()
+    """Chat against an OpenAI-compatible /chat/completions endpoint, with or
+    without an attached image (text-only when image_bytes is None — the
+    reranker's text-query path has no image to send). Only Groq uses this
+    now, but kept as a named function separate from groq_vision_chat/
+    groq_text_chat since it's a generically useful request shape, not a
+    Groq-specific one."""
+    if image_bytes is not None:
+        b64 = base64.b64encode(_downscale_for_vision_api(image_bytes)).decode()
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]
+    else:
+        content = prompt
+
     body = {
         "model": model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ],
-        }],
+        "messages": [{"role": "user", "content": content}],
         "temperature": 0.2,
-        "max_tokens": _VISION_CHAT_MAX_TOKENS,
+        "max_tokens": _CHAT_MAX_TOKENS,
     }
     if extra_params:
         body.update(extra_params)
@@ -98,10 +104,26 @@ def groq_vision_chat(image_bytes: bytes, prompt: str, model: str) -> str:
     has to be stripped before parsing. Verified this param is accepted by
     the current model rather than assumed.
     """
-    return _openai_compatible_vision_chat(
+    return _openai_compatible_chat(
         settings.groq_base_url,
         model,
-        image_bytes,
+        prompt,
+        settings.groq_chat_timeout_seconds,
+        image_bytes=image_bytes,
+        headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+        extra_params={"reasoning_effort": "none"},
+    )
+
+
+@external_api_retry
+def groq_text_chat(prompt: str, model: str) -> str:
+    """Text-only chat against Groq's cloud API (OpenAI-compatible) — the
+    reranker's judge call for a text search query, where there's no query
+    image to send alongside the prompt. See groq_vision_chat's docstring for
+    why reasoning_effort="none" is required."""
+    return _openai_compatible_chat(
+        settings.groq_base_url,
+        model,
         prompt,
         settings.groq_chat_timeout_seconds,
         headers={"Authorization": f"Bearer {settings.groq_api_key}"},
