@@ -146,7 +146,7 @@ function Lightbox({ image, onClose }) {
 
 export default function App() {
   const [messages, setMessages] = useState([
-    { role: "assistant", type: "text", text: "Upload a photo of a piece you like, and I'll find the closest matches in the catalog." },
+    { role: "assistant", type: "text", text: "Upload a photo of a piece you like, or describe it in words, and I'll find the closest matches in the catalog." },
   ]);
   const [pendingImage, setPendingImage] = useState(null);
   const [inputText, setInputText] = useState("");
@@ -167,32 +167,39 @@ export default function App() {
     setPendingImage({ file, url });
   }
 
-  async function runSearch() {
-    if (!pendingImage) return;
-    const imageUrl = pendingImage.url;
-    const caption = inputText.trim();
+  // Dual-mode search: an attached image always wins (typed text alongside it
+  // is just a caption on the user's own message, not sent to the backend —
+  // the API accepts exactly one of image/query_text, never both). With no
+  // image attached, typed text becomes a real text search.
+  async function runSearch({ image, text }) {
     const msgId = nextMsgId.current++;
-
     setMessages((m) => [
       ...m,
-      { id: msgId, role: "user", type: "image", imageUrl, caption, archiveStatus: "saving" },
+      image
+        ? { id: msgId, role: "user", type: "image", imageUrl: image.url, caption: text || "", archiveStatus: "saving" }
+        : { role: "user", type: "text", text },
     ]);
     setIsSearching(true);
     setInputText("");
-    const fileToSend = pendingImage.file;
-    setPendingImage(null);
+    if (image) setPendingImage(null);
 
-    uploadQueryImage(fileToSend)
-      .then(() => {
-        setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "saved" } : msg)));
-      })
-      .catch(() => {
-        setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "error" } : msg)));
-      });
+    if (image) {
+      uploadQueryImage(image.file)
+        .then(() => {
+          setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "saved" } : msg)));
+        })
+        .catch(() => {
+          setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "error" } : msg)));
+        });
+    }
 
     try {
       const form = new FormData();
-      form.append("image", fileToSend);
+      if (image) {
+        form.append("image", image.file);
+      } else {
+        form.append("query_text", text);
+      }
       const res = await fetch(`${API_BASE}/api/v1/search`, {
         method: "POST",
         headers: { "x-api-key": API_KEY },
@@ -204,7 +211,13 @@ export default function App() {
       setMessages((m) => [
         ...m,
         data.no_match
-          ? { role: "assistant", type: "text", text: "Nothing in the catalog is a close enough match yet — try a different angle or a wider shot." }
+          ? {
+              role: "assistant",
+              type: "text",
+              text: image
+                ? "Nothing in the catalog is a close enough match yet — try a different angle or a wider shot."
+                : "Nothing in the catalog matches that description yet — try describing it differently.",
+            }
           : { role: "assistant", type: "results", matches: data.matches },
       ]);
     } catch {
@@ -217,15 +230,9 @@ export default function App() {
 
   function handleSend() {
     if (pendingImage) {
-      runSearch();
+      runSearch({ image: pendingImage, text: inputText.trim() });
     } else if (inputText.trim()) {
-      const text = inputText.trim();
-      setMessages((m) => [
-        ...m,
-        { role: "user", type: "text", text },
-        { role: "assistant", type: "text", text: "Attach a photo of the piece and I'll search the catalog for visual matches." },
-      ]);
-      setInputText("");
+      runSearch({ text: inputText.trim() });
     }
   }
 

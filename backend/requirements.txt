@@ -4,6 +4,7 @@ pydantic==2.9.2
 python-multipart==0.0.9
 google-genai==0.3.0
 pinecone-client==5.0.1
+supabase==2.31.0
 Pillow==10.4.0
 numpy==1.26.4
 tenacity==9.0.0

@@ -86,6 +86,33 @@ def test_persistent_failure_is_reraised_after_retry_attempts(mocker, no_sleep):
     assert mock_embed.call_count == 3
 
 
+def test_embed_text_query_uses_retrieval_query_task_type(mocker):
+    mock_embed = mocker.patch.object(
+        embeddings._client.models, "embed_content", return_value=_fake_response()
+    )
+
+    result = embeddings.embed_text_query("gold pink enamel earrings")
+
+    assert result == FAKE_VECTOR
+    kwargs = mock_embed.call_args.kwargs
+    assert kwargs["config"].task_type == "RETRIEVAL_QUERY"
+    assert kwargs["contents"] == "gold pink enamel earrings"
+    assert kwargs["config"].output_dimensionality == embeddings.settings.embedding_dimensions
+
+
+def test_embed_text_query_retries_on_transient_failure(mocker, no_sleep):
+    mock_embed = mocker.patch.object(
+        embeddings._client.models,
+        "embed_content",
+        side_effect=[Exception("transient network error"), _fake_response()],
+    )
+
+    result = embeddings.embed_text_query("gold ring")
+
+    assert result == FAKE_VECTOR
+    assert mock_embed.call_count == 2
+
+
 def test_caption_image_uses_gemini_by_default(mocker):
     mock_generate = mocker.patch.object(
         embeddings._client.models,

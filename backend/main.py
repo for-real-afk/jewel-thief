@@ -13,10 +13,11 @@ import logging
 import re
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
@@ -34,10 +35,24 @@ app = FastAPI(title="Jewellery Visual Search API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
+    allow_origin_regex=settings.allowed_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Without this, an unhandled exception (e.g. a downstream API outage)
+    propagates past CORSMiddleware entirely to Starlette's default error
+    handler, which returns a response with NO CORS headers at all — the
+    browser then reports a misleading "CORS policy" error that has nothing
+    to do with CORS configuration, masking the real 500 and its actual cause.
+    Catching it here keeps the response inside the normal middleware chain,
+    so CORSMiddleware still gets to attach its headers."""
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 # Search results need something to actually show the user — catalog images
 # are persisted here at indexing time and served back as image_url metadata,
@@ -66,6 +81,7 @@ class SearchResponse(BaseModel):
     query_id: str
     matches: list[MatchResult]
     no_match: bool
+    query_type: Literal["image", "text"]
 
 
 class IndexResponse(BaseModel):
@@ -137,21 +153,47 @@ def health():
 
 @app.post("/api/v1/search", response_model=SearchResponse, dependencies=[])
 async def search(
-    image: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),
+    query_text: Optional[str] = Form(None),
     category: Optional[str] = Form(None),
     max_price: Optional[float] = Form(None),
     min_price: Optional[float] = Form(None),
     x_api_key: Optional[str] = Header(None),
 ):
+    """
+    Accepts EITHER an image OR a text query, never both — the two paths
+    share the same Pinecone index and the same embedding model
+    (gemini-embedding-2 is natively multimodal: text and images already
+    live in one comparable vector space, so a text query just needs
+    task_type="RETRIEVAL_QUERY" like an image query does, not a separate
+    pipeline). Everything downstream of embedding — metadata filtering,
+    vector_db.search, the similarity threshold, reranking — is identical
+    regardless of which input type was used.
+    """
     require_api_key(x_api_key)
 
-    raw_bytes = await image.read()
-    try:
-        clean_bytes = prepare_image_bytes(raw_bytes)
-    except InvalidImageError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    has_image = image is not None
+    text = (query_text or "").strip()
+    has_text = bool(text)
 
-    query_vector = embeddings.embed_query_image(clean_bytes)
+    if not has_image and not has_text:
+        raise HTTPException(status_code=400, detail="Provide either an image or a text query.")
+    if has_image and has_text:
+        raise HTTPException(status_code=400, detail="Provide only one of image or text query, not both.")
+
+    if has_image:
+        raw_bytes = await image.read()
+        try:
+            clean_bytes = prepare_image_bytes(raw_bytes)
+        except InvalidImageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        query_vector = embeddings.embed_query_image(clean_bytes)
+        query_type: Literal["image", "text"] = "image"
+        rerank_query = {"type": "image", "bytes": clean_bytes}
+    else:
+        query_vector = embeddings.embed_text_query(text)
+        query_type = "text"
+        rerank_query = {"type": "text", "text": text}
 
     metadata_filter: dict = {}
     if category:
@@ -166,17 +208,24 @@ async def search(
 
     raw_matches = vector_db.search(query_vector, metadata_filter=metadata_filter or None)
 
-    # Apply similarity threshold before spending a reranker call on weak candidates.
-    strong_matches = [m for m in raw_matches if m["score"] >= settings.min_similarity_threshold]
+    # Apply similarity threshold before spending a reranker call on weak
+    # candidates. Text queries use a lower bar than image queries -- see
+    # config.py's min_similarity_threshold_text comment for why cross-modal
+    # cosine scores run systematically lower even for true matches.
+    threshold = (
+        settings.min_similarity_threshold_text if query_type == "text" else settings.min_similarity_threshold
+    )
+    strong_matches = [m for m in raw_matches if m["score"] >= threshold]
 
     if not strong_matches:
-        return SearchResponse(query_id=str(uuid.uuid4()), matches=[], no_match=True)
+        return SearchResponse(query_id=str(uuid.uuid4()), matches=[], no_match=True, query_type=query_type)
 
-    ranked = reranker.rerank(clean_bytes, strong_matches)
+    ranked = reranker.rerank(rerank_query, strong_matches)
 
     return SearchResponse(
         query_id=str(uuid.uuid4()),
         no_match=False,
+        query_type=query_type,
         matches=[
             MatchResult(
                 id=m["id"],

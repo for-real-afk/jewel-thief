@@ -65,8 +65,21 @@ def _color_embedding(image_bytes: bytes, dims: int) -> list:
     return (vec / norm if norm > 0 else vec).tolist()
 
 
+# Maps a color word in a text query to the same RGB used to build the
+# matching catalog image below, so a text query like "red ring" fakes a
+# semantically-plausible embedding without needing real Gemini text
+# understanding. Real gemini-embedding-2 quality on color/material terms is
+# NOT verified by this fake -- see README.md's Known Limitations note.
+_COLOR_WORDS = {"red": (200, 30, 30), "blue": (30, 60, 200), "green": (40, 160, 60)}
+
+
 def _fake_embed_content(*, model, contents, config):
-    image_bytes = contents.inline_data.data
+    if isinstance(contents, str):
+        text = contents.lower()
+        color = next((rgb for word, rgb in _COLOR_WORDS.items() if word in text), (128, 128, 128))
+        image_bytes = _make_jpeg_bytes(color)
+    else:
+        image_bytes = contents.inline_data.data
     values = _color_embedding(image_bytes, config.output_dimensionality)
     return SimpleNamespace(embeddings=[SimpleNamespace(values=values)])
 
@@ -123,16 +136,34 @@ def _make_jpeg_bytes(color, shape="rectangle") -> bytes:
     return buf.getvalue()
 
 
+def _print_results(title: str, ranked: list) -> None:
+    print(f"\n{title}")
+    header = f"{'id':<20} {'similarity_percent':>18} {'confidence':>10}  reason"
+    print(header)
+    print("-" * len(header))
+    for m in ranked:
+        similarity_percent = round(m["score"] * 100, 1)
+        print(f"{m['id']:<20} {similarity_percent:>18} {m['confidence']:>10}  {m['reason']}")
+
+
 def main() -> int:
+    # Force the Gemini reranker path regardless of the real LLM_PROVIDER in
+    # .env (e.g. "groq") -- otherwise reranker.rerank() would call the
+    # unpatched utils.groq_*_chat functions and make a real network call
+    # with real credentials, defeating the point of this fake-only script.
     with patch.object(embeddings._client.models, "embed_content", side_effect=_fake_embed_content), \
          patch.object(reranker._client.models, "generate_content", side_effect=_fake_generate_content), \
+         patch.object(reranker.settings, "llm_provider", "gemini"), \
          patch.object(vector_db, "get_or_create_index", return_value=_FakeIndex()):
 
         print("Ingesting 3 sample catalog images...")
         catalog = [
-            {"id": "ring-red-01", "raw": _make_jpeg_bytes((200, 30, 30)), "metadata": {"category": "ring", "price": 199.0}},
-            {"id": "necklace-blue-01", "raw": _make_jpeg_bytes((30, 60, 200)), "metadata": {"category": "necklace", "price": 299.0}},
-            {"id": "earring-green-01", "raw": _make_jpeg_bytes((40, 160, 60)), "metadata": {"category": "earring", "price": 49.0}},
+            {"id": "ring-red-01", "raw": _make_jpeg_bytes((200, 30, 30)),
+             "metadata": {"category": "ring", "price": 199.0, "name": "Ruby Halo Ring", "caption": "a red gemstone ring"}},
+            {"id": "necklace-blue-01", "raw": _make_jpeg_bytes((30, 60, 200)),
+             "metadata": {"category": "necklace", "price": 299.0, "name": "Sapphire Drop Necklace", "caption": "a blue gemstone necklace"}},
+            {"id": "earring-green-01", "raw": _make_jpeg_bytes((40, 160, 60)),
+             "metadata": {"category": "earring", "price": 49.0, "name": "Emerald Stud Earring", "caption": "a green gemstone earring"}},
         ]
         to_upsert = []
         for item in catalog:
@@ -142,7 +173,7 @@ def main() -> int:
         indexed_count = vector_db.upsert_batch(to_upsert)
         print(f"  -> indexed {indexed_count} items.")
 
-        print("Running search against 1 query image...")
+        print("Running image search against 1 query image...")
         # Same red as ring-red-01 plus a highlight circle, simulating a
         # customer photo of the same item under different lighting/angle.
         query_raw = _make_jpeg_bytes((210, 35, 25), shape="circle")
@@ -151,21 +182,25 @@ def main() -> int:
 
         raw_matches = vector_db.search(query_vector, top_k=settings.top_k)
         strong_matches = [m for m in raw_matches if m["score"] >= settings.min_similarity_threshold]
-        if not strong_matches:
-            ranked = []
-        else:
-            ranked = reranker.rerank(query_clean, strong_matches)
+        image_ranked = [] if not strong_matches else reranker.rerank(
+            {"type": "image", "bytes": query_clean}, strong_matches
+        )
 
-    print("\nFinal ranked results:")
-    header = f"{'id':<20} {'similarity_percent':>18} {'confidence':>10}  reason"
-    print(header)
-    print("-" * len(header))
-    for m in ranked:
-        similarity_percent = round(m["score"] * 100, 1)
-        print(f"{m['id']:<20} {similarity_percent:>18} {m['confidence']:>10}  {m['reason']}")
+        print("Running text search against 1 query string...")
+        query_text = "a blue gemstone necklace"
+        text_query_vector = embeddings.embed_text_query(query_text)
 
-    if not ranked:
-        print("\nFAILED: no results returned.")
+        text_raw_matches = vector_db.search(text_query_vector, top_k=settings.top_k)
+        text_strong_matches = [m for m in text_raw_matches if m["score"] >= settings.min_similarity_threshold]
+        text_ranked = [] if not text_strong_matches else reranker.rerank(
+            {"type": "text", "text": query_text}, text_strong_matches
+        )
+
+    _print_results("Image search - final ranked results:", image_ranked)
+    _print_results(f'Text search ("{query_text}") - final ranked results:', text_ranked)
+
+    if not image_ranked or not text_ranked:
+        print("\nFAILED: no results returned for one or both search flows.")
         return 1
 
     print("\nSmoke test passed.")

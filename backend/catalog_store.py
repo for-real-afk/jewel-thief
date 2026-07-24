@@ -1,43 +1,33 @@
 """
-Local catalog index for GET /api/v1/catalog/items.
+Catalog metadata store for GET /api/v1/catalog/items, backed by Supabase.
 
 Pinecone doesn't support convenient arbitrary listing — its list() call
 returns IDs only (no metadata) and isn't meant for admin-table pagination.
-A JSON file is enough for a single-process dev/admin tool; move this to a
-real table (Postgres/SQLite) before running multiple backend instances, same
-caveat as main.py's in-memory job dict.
+This mirrors every Pinecone upsert into a `catalog_items` table so the
+admin UI can page through metadata without touching the vector index.
 """
-import json
-import threading
-from pathlib import Path
+from supabase import create_client
 
-_STORE_PATH = Path(__file__).resolve().parent / "catalog_store.json"
-_lock = threading.Lock()
+from config import get_settings
 
-
-def _load() -> dict:
-    if _STORE_PATH.exists():
-        return json.loads(_STORE_PATH.read_text())
-    return {}
-
-
-def _save(data: dict) -> None:
-    _STORE_PATH.write_text(json.dumps(data, indent=2))
+settings = get_settings()
+_client = create_client(settings.supabase_url, settings.supabase_key)
+_TABLE = "catalog_items"
 
 
 def record_item(item_id: str, metadata: dict) -> None:
-    """Upsert one item's metadata into the local store (mirrors the Pinecone upsert)."""
-    with _lock:
-        data = _load()
-        data[item_id] = metadata
-        _save(data)
+    """Upsert one item's metadata into the catalog table (mirrors the Pinecone upsert)."""
+    _client.table(_TABLE).upsert({"item_id": item_id, "metadata": metadata}).execute()
 
 
 def list_items(limit: int, offset: int) -> tuple[list[dict], int]:
     """Newest-first page of {item_id, **metadata} dicts, plus the total count."""
-    with _lock:
-        data = _load()
-    items = [{"item_id": item_id, **metadata} for item_id, metadata in data.items()]
-    items.reverse()  # dict preserves insertion order in Python 3.7+ -> newest last -> reverse
-    total = len(items)
-    return items[offset:offset + limit], total
+    result = (
+        _client.table(_TABLE)
+        .select("item_id, metadata", count="exact")
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+    items = [{"item_id": row["item_id"], **row["metadata"]} for row in result.data]
+    return items, result.count or 0

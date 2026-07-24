@@ -26,6 +26,7 @@ os.environ.setdefault("PINECONE_CLOUD", "aws")
 os.environ.setdefault("PINECONE_REGION", "us-east-1")
 os.environ.setdefault("TOP_K", "20")
 os.environ.setdefault("MIN_SIMILARITY_THRESHOLD", "0.55")
+os.environ.setdefault("MIN_SIMILARITY_THRESHOLD_TEXT", "0.35")
 os.environ.setdefault("APP_API_KEY", "test-api-key")
 os.environ.setdefault("ALLOWED_ORIGINS", "http://localhost:5173")
 

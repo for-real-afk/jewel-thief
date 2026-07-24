@@ -41,15 +41,34 @@ class Settings(BaseModel):
     pinecone_cloud: str = os.getenv("PINECONE_CLOUD", "aws")
     pinecone_region: str = os.getenv("PINECONE_REGION", "us-east-1")
 
+    # -- Supabase (catalog metadata table) --
+    supabase_url: str = os.getenv("SUPABASE_URL", "")
+    supabase_key: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+
     # -- Search behavior --
     top_k: int = int(os.getenv("TOP_K", "20"))
     min_similarity_threshold: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.55"))
+    # Text queries are compared cross-modal (text vector vs. image-derived
+    # catalog vectors) and measured lower in absolute cosine score than
+    # image-vs-image comparisons even for genuinely relevant matches -- real
+    # production data against the live catalog showed true positives around
+    # 0.40-0.47 with irrelevant categories starting to blend in only around
+    # ~0.40, nowhere near the 0.55 bar tuned for image queries. This cutoff
+    # only exists to avoid spending a reranker LLM call on true noise; the
+    # reranker's metadata-based judgment (reranker.py's _TEXT_PROMPT_TEMPLATE)
+    # is what actually filters wrong-category results, not this threshold.
+    min_similarity_threshold_text: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD_TEXT", "0.35"))
 
     # -- API auth --
     api_key: str = os.getenv("APP_API_KEY", "change-me-in-production")
 
     # -- CORS --
     allowed_origins: list[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    # Optional regex for origins that vary per-deploy (e.g. Vercel preview URLs
+    # like https://jewel-thief-git-<branch>-<team>.vercel.app), so every new
+    # preview doesn't require manually editing ALLOWED_ORIGINS. Example:
+    # ALLOWED_ORIGIN_REGEX=https://jewel-thief.*\.vercel\.app
+    allowed_origin_regex: str | None = os.getenv("ALLOWED_ORIGIN_REGEX") or None
 
 
 @lru_cache
