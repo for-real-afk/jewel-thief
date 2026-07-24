@@ -208,8 +208,14 @@ async def search(
 
     raw_matches = vector_db.search(query_vector, metadata_filter=metadata_filter or None)
 
-    # Apply similarity threshold before spending a reranker call on weak candidates.
-    strong_matches = [m for m in raw_matches if m["score"] >= settings.min_similarity_threshold]
+    # Apply similarity threshold before spending a reranker call on weak
+    # candidates. Text queries use a lower bar than image queries -- see
+    # config.py's min_similarity_threshold_text comment for why cross-modal
+    # cosine scores run systematically lower even for true matches.
+    threshold = (
+        settings.min_similarity_threshold_text if query_type == "text" else settings.min_similarity_threshold
+    )
+    strong_matches = [m for m in raw_matches if m["score"] >= threshold]
 
     if not strong_matches:
         return SearchResponse(query_id=str(uuid.uuid4()), matches=[], no_match=True, query_type=query_type)

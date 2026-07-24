@@ -207,6 +207,43 @@ def test_search_text_query_requires_api_key():
     assert resp.status_code == 401
 
 
+def test_search_text_query_uses_lower_threshold_than_image_query(mocker):
+    # 0.45 clears MIN_SIMILARITY_THRESHOLD_TEXT (0.35) but not
+    # MIN_SIMILARITY_THRESHOLD (0.55) -- real production cross-modal text
+    # queries against the live catalog scored true positives in exactly
+    # this 0.40-0.47 range, well under the image-tuned 0.55 bar.
+    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    borderline_matches = [_fake_match("a", 0.45)]
+    mocker.patch.object(main.vector_db, "search", return_value=borderline_matches)
+    mocker.patch.object(main.reranker, "rerank", return_value=[_fake_ranked(m) for m in borderline_matches])
+
+    resp = client.post(
+        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["no_match"] is False
+    assert len(body["matches"]) == 1
+
+
+def test_search_image_query_still_rejects_score_that_would_pass_text_threshold(mocker, valid_jpeg_bytes):
+    # Same 0.45 score -- must still be rejected on the image path, proving
+    # the lower bar is applied only to query_type="text", not globally.
+    mocker.patch.object(main.embeddings, "embed_query_image", return_value=[0.1] * 8)
+    borderline_matches = [_fake_match("a", 0.45)]
+    mocker.patch.object(main.vector_db, "search", return_value=borderline_matches)
+    mock_rerank = mocker.patch.object(main.reranker, "rerank")
+
+    resp = client.post(
+        "/api/v1/search", files=_image_file(valid_jpeg_bytes), headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["no_match"] is True
+    mock_rerank.assert_not_called()
+
+
 def _item(item_id, name="Item", category="ring", price=100.0, **extra):
     return {"item_id": item_id, "name": name, "category": category, "price": price, **extra}
 

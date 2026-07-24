@@ -460,7 +460,8 @@ npm run dev   # http://localhost:5173
 | `LLM_PROVIDER` | `gemini` or `groq` — see §6 |
 | `EMBEDDING_DIMENSIONS` | Must match what `gemini-embedding-2` actually outputs, and must match the Pinecone index's fixed dimension |
 | `TOP_K` | How many ANN candidates `vector_db.search()` retrieves before threshold filtering |
-| `MIN_SIMILARITY_THRESHOLD` | Cosine score floor before a candidate is even sent to the reranker |
+| `MIN_SIMILARITY_THRESHOLD` | Cosine score floor for **image** queries before a candidate is even sent to the reranker |
+| `MIN_SIMILARITY_THRESHOLD_TEXT` | Cosine score floor for **text** queries — deliberately lower than `MIN_SIMILARITY_THRESHOLD`; cross-modal (text-vs-image) cosine scores run lower in absolute terms even for true matches (§11) |
 | `GROQ_CHAT_TIMEOUT_SECONDS` | Must be generous enough for a full `TOP_K`-candidate batch in one prompt, not just a single small request (see §6, point 2) — Groq's cloud inference needs far less headroom here than the local model that used to fill this role did |
 | `GROQ_MODEL` | Whatever vision-capable model is available on the account; verify via `GET /v1/models`, don't assume a name |
 
@@ -508,12 +509,22 @@ python scripts/smoke_test.py
 - `BackgroundTasks` (stdlib, in-process) is fine at this scale; swap for a real queue
   (Celery/RQ/Cloud Tasks) before indexing volume grows large enough that a backend
   restart mid-batch becomes a real operational risk.
-- **Text-query embedding quality is unmeasured.** `embed_text_query()` (§3.2, §4.2)
-  relies on `gemini-embedding-2` correctly encoding color/material/style terms into a
-  space that's meaningfully comparable to the catalog's pixel-only image embeddings —
-  this is architecturally sound (same model, same space, documented asymmetric
-  retrieval convention) but, same as the `gemini-2.5-flash` reranker caveat above, was
-  **not live-tested against real catalog data this session**. Before trusting text
-  search for real merchandising decisions, run real queries ("gold pink enamel
-  earrings") against a real indexed catalog and check whether the top results are
-  actually relevant, not just whether the endpoint returns 200.
+- **Text-query cosine scores run systematically lower than image-query ones — this WAS
+  measured against the live production catalog** (unlike the untested
+  `gemini-2.5-flash` reranker caveat above) after text search initially returned
+  `no_match` for every real query in production. `embed_text_query()` does correctly
+  encode color/material/style terms — e.g. "gold jhumka earrings" against the live
+  catalog ranked every genuine earring above every necklace/bracelet, and the actual
+  hand-named "royal-traditional-indian-jhumka" item near the top for a matching query —
+  but the *absolute* cosine magnitude for a true cross-modal (text query vs.
+  image-derived catalog vector) match tops out around 0.40-0.47, not the ~0.55+ seen for
+  genuine image-vs-image matches. `MIN_SIMILARITY_THRESHOLD` (image queries) and
+  `MIN_SIMILARITY_THRESHOLD_TEXT` (text queries, default `0.35`) are now separate
+  settings (`config.py`) for exactly this reason — using one threshold for both silently
+  zeroed out all text search results. The lower text bar is safe specifically because
+  the reranker's metadata-based judgment (§6) is the actual precision filter for text
+  queries; the cosine threshold's only job is skipping a reranker call on true noise, and
+  0.35 was chosen with margin below the observed 0.40 point where irrelevant categories
+  start blending in. This split has NOT been tuned against a broader, more diverse
+  catalog or a wider range of query phrasing — revisit if false positives become a
+  problem as the catalog grows.

@@ -44,6 +44,16 @@ class Settings(BaseModel):
     # -- Search behavior --
     top_k: int = int(os.getenv("TOP_K", "20"))
     min_similarity_threshold: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.55"))
+    # Text queries are compared cross-modal (text vector vs. image-derived
+    # catalog vectors) and measured lower in absolute cosine score than
+    # image-vs-image comparisons even for genuinely relevant matches -- real
+    # production data against the live catalog showed true positives around
+    # 0.40-0.47 with irrelevant categories starting to blend in only around
+    # ~0.40, nowhere near the 0.55 bar tuned for image queries. This cutoff
+    # only exists to avoid spending a reranker LLM call on true noise; the
+    # reranker's metadata-based judgment (reranker.py's _TEXT_PROMPT_TEMPLATE)
+    # is what actually filters wrong-category results, not this threshold.
+    min_similarity_threshold_text: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD_TEXT", "0.35"))
 
     # -- API auth --
     api_key: str = os.getenv("APP_API_KEY", "change-me-in-production")

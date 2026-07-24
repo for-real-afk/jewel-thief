@@ -52,6 +52,8 @@ services:
         value: "20"
       - key: MIN_SIMILARITY_THRESHOLD
         value: "0.55"
+      - key: MIN_SIMILARITY_THRESHOLD_TEXT
+        value: "0.35"
 
       # -- Auth --
       - key: APP_API_KEY
