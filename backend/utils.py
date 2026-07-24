@@ -1,7 +1,9 @@
 """Shared utilities: retry/backoff for flaky external APIs (Gemini, Pinecone, Groq)."""
 import base64
+import io
 
 import requests
+from PIL import Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from config import get_settings
@@ -19,6 +21,23 @@ settings = get_settings()
 # objects, with headroom to spare — not meant to bound reasoning tokens.
 _VISION_CHAT_MAX_TOKENS = 4096
 
+# preprocessing.py caps catalog/query images at 1024x1024 for embedding
+# quality, but a vision-chat *judge* call doesn't need that much resolution
+# to compare gemstone cut/metal color/silhouette — and the base64-encoded
+# 1024px JPEG was large enough to hit Groq's request size limit (measured:
+# a real production request 413'd). Downscale specifically for this HTTP
+# path; the stored catalog image and the Gemini embedding call are untouched.
+_VISION_CHAT_MAX_DIMENSION = 512
+_VISION_CHAT_JPEG_QUALITY = 80
+
+
+def _downscale_for_vision_api(image_bytes: bytes) -> bytes:
+    img = Image.open(io.BytesIO(image_bytes))
+    img.thumbnail((_VISION_CHAT_MAX_DIMENSION, _VISION_CHAT_MAX_DIMENSION), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=_VISION_CHAT_JPEG_QUALITY)
+    return buf.getvalue()
+
 
 def _openai_compatible_vision_chat(
     base_url: str,
@@ -33,7 +52,7 @@ def _openai_compatible_vision_chat(
     endpoint. Only Groq uses this now, but kept as a named function separate
     from groq_vision_chat since it's a generically useful request shape, not
     a Groq-specific one."""
-    b64 = base64.b64encode(image_bytes).decode()
+    b64 = base64.b64encode(_downscale_for_vision_api(image_bytes)).decode()
     body = {
         "model": model,
         "messages": [{
@@ -50,7 +69,13 @@ def _openai_compatible_vision_chat(
         body.update(extra_params)
 
     response = requests.post(f"{base_url}/chat/completions", json=body, headers=headers, timeout=timeout)
-    response.raise_for_status()
+    if not response.ok:
+        # raise_for_status()'s default message doesn't include the response
+        # body — often the only place the *actual* rejection reason lives
+        # (e.g. Groq's 413 body names the exact size limit hit).
+        raise requests.exceptions.HTTPError(
+            f"{response.status_code} error from {base_url}: {response.text[:500]}", response=response
+        )
     return response.json()["choices"][0]["message"]["content"]
 
 
