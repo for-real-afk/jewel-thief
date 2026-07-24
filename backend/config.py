@@ -41,6 +41,10 @@ class Settings(BaseModel):
     pinecone_cloud: str = os.getenv("PINECONE_CLOUD", "aws")
     pinecone_region: str = os.getenv("PINECONE_REGION", "us-east-1")
 
+    # -- Supabase (catalog metadata table) --
+    supabase_url: str = os.getenv("SUPABASE_URL", "")
+    supabase_key: str = os.getenv("SUPABASE_SERVICE_KEY", "")
+
     # -- Search behavior --
     top_k: int = int(os.getenv("TOP_K", "20"))
     min_similarity_threshold: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.55"))
