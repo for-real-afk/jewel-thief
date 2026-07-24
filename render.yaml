@@ -57,11 +57,11 @@ services:
       - key: APP_API_KEY
         sync: false
 
-      # -- CORS: update ALLOWED_ORIGINS to the real Vercel production URL
-      # after the frontend is deployed. ALLOWED_ORIGIN_REGEX (optional) can
-      # match every Vercel preview URL for this project instead of listing
-      # them one by one — see DEPLOYMENT.md.
+      # -- CORS --
       - key: ALLOWED_ORIGINS
-        value: https://your-app.vercel.app
+        value: https://jewel-thief.vercel.app
+      # Also matches every Vercel preview URL for this project
+      # (jewel-thief-git-<branch>-<team>.vercel.app), so a PR/branch deploy
+      # doesn't need ALLOWED_ORIGINS updated by hand each time.
       - key: ALLOWED_ORIGIN_REGEX
-        value: ""
+        value: https://jewel-thief.*\.vercel\.app
