@@ -15,8 +15,9 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
@@ -39,6 +40,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Without this, an unhandled exception (e.g. a downstream API outage)
+    propagates past CORSMiddleware entirely to Starlette's default error
+    handler, which returns a response with NO CORS headers at all — the
+    browser then reports a misleading "CORS policy" error that has nothing
+    to do with CORS configuration, masking the real 500 and its actual cause.
+    Catching it here keeps the response inside the normal middleware chain,
+    so CORSMiddleware still gets to attach its headers."""
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 # Search results need something to actually show the user — catalog images
 # are persisted here at indexing time and served back as image_url metadata,

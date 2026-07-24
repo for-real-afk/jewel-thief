@@ -58,6 +58,19 @@ def _strip_reasoning(raw_text: str) -> str:
     return _THINK_BLOCK_RE.sub("", raw_text).strip()
 
 
+# Only fields that actually inform a visual-similarity judgment. Dumping the
+# full metadata dict (description, tags, image_url, filename, price, ...)
+# into the prompt for every one of up to TOP_K candidates was pure wasted
+# token budget — a real contributor to a production Groq rate-limit error
+# (see utils.py's _VISION_CHAT_MAX_TOKENS comment for the full incident).
+_PROMPT_RELEVANT_METADATA_FIELDS = ("name", "category", "material")
+
+
+def _summarize_for_prompt(metadata: dict) -> str:
+    parts = [f"{k}={metadata[k]}" for k in _PROMPT_RELEVANT_METADATA_FIELDS if metadata.get(k)]
+    return f"metadata: {', '.join(parts)}" if parts else "metadata: none"
+
+
 @external_api_retry
 def _judge_gemini(query_image_bytes: bytes, prompt: str) -> str:
     response = _client.models.generate_content(
@@ -87,8 +100,7 @@ def rerank(
         return []
 
     candidate_list = "\n".join(
-        f"- id: {c['id']}, cosine_similarity: {c['score']:.3f}, "
-        f"metadata: {c['metadata']}"
+        f"- id: {c['id']}, cosine_similarity: {c['score']:.3f}, {_summarize_for_prompt(c['metadata'])}"
         for c in candidates
     )
     prompt = _PROMPT_TEMPLATE.format(n=len(candidates), candidate_list=candidate_list)

@@ -17,18 +17,25 @@ external_api_retry = retry(
 
 settings = get_settings()
 
-# Generous enough for a full top_k batch of {id, confidence, reason} JSON
-# objects, with headroom to spare — not meant to bound reasoning tokens.
-_VISION_CHAT_MAX_TOKENS = 4096
+# Real production incident: Groq's free/on_demand tier enforces an 8000
+# tokens-PER-REQUEST-MINUTE budget, and its rate limiter appears to count
+# prompt_tokens + max_tokens (the theoretical worst case), not actual usage
+# — a request measured at "Requested 8117" with max_tokens=4096 implies the
+# prompt itself cost ~4021 tokens, and max_tokens=4096 alone pushed the
+# *requested* total over the 8000 cap even though real usage was far lower.
+# A ~20-item {id, confidence, reason} JSON array response realistically
+# needs a few hundred tokens; 2048 leaves generous headroom without
+# needlessly inflating the requested-token count that gates the limit.
+_VISION_CHAT_MAX_TOKENS = 2048
 
 # preprocessing.py caps catalog/query images at 1024x1024 for embedding
 # quality, but a vision-chat *judge* call doesn't need that much resolution
 # to compare gemstone cut/metal color/silhouette — and the base64-encoded
-# 1024px JPEG was large enough to hit Groq's request size limit (measured:
-# a real production request 413'd). Downscale specifically for this HTTP
-# path; the stored catalog image and the Gemini embedding call are untouched.
-_VISION_CHAT_MAX_DIMENSION = 512
-_VISION_CHAT_JPEG_QUALITY = 80
+# image is itself a meaningful chunk of the token budget above. Downscale
+# specifically for this HTTP path; the stored catalog image and the Gemini
+# embedding call are untouched.
+_VISION_CHAT_MAX_DIMENSION = 384
+_VISION_CHAT_JPEG_QUALITY = 75
 
 
 def _downscale_for_vision_api(image_bytes: bytes) -> bytes:
