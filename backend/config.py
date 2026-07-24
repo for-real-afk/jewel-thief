@@ -50,6 +50,11 @@ class Settings(BaseModel):
 
     # -- CORS --
     allowed_origins: list[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    # Optional regex for origins that vary per-deploy (e.g. Vercel preview URLs
+    # like https://jewel-thief-git-<branch>-<team>.vercel.app), so every new
+    # preview doesn't require manually editing ALLOWED_ORIGINS. Example:
+    # ALLOWED_ORIGIN_REGEX=https://jewel-thief.*\.vercel\.app
+    allowed_origin_regex: str | None = os.getenv("ALLOWED_ORIGIN_REGEX") or None
 
 
 @lru_cache

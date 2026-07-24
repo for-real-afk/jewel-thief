@@ -1,0 +1,67 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+# Deploy: Render dashboard -> New -> Blueprint -> point at this repo.
+# Vars marked `sync: false` are secrets Render will prompt for and store
+# encrypted; they are never read from this file or committed anywhere.
+services:
+  - type: web
+    name: jewel-thief-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+
+      # -- Gemini (embeddings + optional reranker) --
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: EMBEDDING_MODEL
+        value: gemini-embedding-2
+      - key: EMBEDDING_DIMENSIONS
+        value: "768"
+      - key: RERANKER_MODEL
+        value: gemini-2.5-flash
+
+      # -- Reranker provider: "gemini" or "groq" --
+      - key: LLM_PROVIDER
+        value: groq
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: GROQ_MODEL
+        value: qwen/qwen3.6-27b
+      - key: GROQ_CHAT_TIMEOUT_SECONDS
+        value: "60"
+
+      # -- Pinecone --
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: jewellery-catalog
+      - key: PINECONE_CLOUD
+        value: aws
+      - key: PINECONE_REGION
+        value: us-east-1
+
+      # -- Search behavior --
+      - key: TOP_K
+        value: "20"
+      - key: MIN_SIMILARITY_THRESHOLD
+        value: "0.55"
+
+      # -- Auth --
+      - key: APP_API_KEY
+        sync: false
+
+      # -- CORS: update ALLOWED_ORIGINS to the real Vercel production URL
+      # after the frontend is deployed. ALLOWED_ORIGIN_REGEX (optional) can
+      # match every Vercel preview URL for this project instead of listing
+      # them one by one — see DEPLOYMENT.md.
+      - key: ALLOWED_ORIGINS
+        value: https://your-app.vercel.app
+      - key: ALLOWED_ORIGIN_REGEX
+        value: ""
