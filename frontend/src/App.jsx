@@ -4,12 +4,45 @@ import TopNav from "./TopNav.jsx";
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 
+// Archives the user's query image to object storage (S3) via a backend-issued
+// pre-signed URL, so the browser never holds AWS credentials directly.
+async function uploadQueryImage(file) {
+  const presignRes = await fetch(`${API_BASE}/api/v1/uploads/presign`, {
+    method: "POST",
+    headers: { "x-api-key": API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: file.name, content_type: file.type }),
+  });
+  if (!presignRes.ok) throw new Error("presign request failed");
+  const { upload_url } = await presignRes.json();
+
+  const putRes = await fetch(upload_url, {
+    method: "PUT",
+    headers: { "Content-Type": file.type },
+    body: file,
+  });
+  if (!putRes.ok) throw new Error("upload to storage failed");
+}
+
+// Generates a simple ring illustration entirely locally (no network fetch) so
+// the demo fallback below has something real to show and click into.
+function ringDataUri(bandColor, stoneColor) {
+  const svg = `
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200">
+      <rect width="200" height="200" fill="#f4efe6"/>
+      <circle cx="100" cy="120" r="55" fill="none" stroke="${bandColor}" stroke-width="14"/>
+      <polygon points="100,45 120,75 100,100 80,75" fill="${stoneColor}" stroke="#fff" stroke-width="2"/>
+      <polygon points="100,45 120,75 100,90" fill="rgba(255,255,255,0.35)"/>
+    </svg>
+  `.trim();
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
 // Demo fallback so this UI is inspectable even without a live backend.
 const DEMO_MATCHES = [
-  { id: "RN-2281", similarity_percent: 94.2, confidence: "high", reason: "matching pear-cut stone and pavé band", metadata: { name: "Pear Halo Ring", price: 1240, category: "rings" } },
-  { id: "RN-2214", similarity_percent: 88.7, confidence: "high", reason: "same rose-gold finish, narrower band", metadata: { name: "Rose Solitaire Ring", price: 980, category: "rings" } },
-  { id: "RN-2097", similarity_percent: 79.5, confidence: "medium", reason: "similar silhouette, different metal tone", metadata: { name: "Classic Pavé Ring", price: 860, category: "rings" } },
-  { id: "RN-1950", similarity_percent: 71.3, confidence: "medium", reason: "comparable cut, plainer band", metadata: { name: "Petite Solitaire", price: 640, category: "rings" } },
+  { id: "RN-2281", similarity_percent: 94.2, confidence: "high", reason: "matching pear-cut stone and pavé band", metadata: { name: "Pear Halo Ring", price: 1240, category: "rings", image_url: ringDataUri("#caa86a", "#e8e0d0") } },
+  { id: "RN-2214", similarity_percent: 88.7, confidence: "high", reason: "same rose-gold finish, narrower band", metadata: { name: "Rose Solitaire Ring", price: 980, category: "rings", image_url: ringDataUri("#c48a72", "#f2d9d9") } },
+  { id: "RN-2097", similarity_percent: 79.5, confidence: "medium", reason: "similar silhouette, different metal tone", metadata: { name: "Classic Pavé Ring", price: 860, category: "rings", image_url: ringDataUri("#9a9a9a", "#e6f0f5") } },
+  { id: "RN-1950", similarity_percent: 71.3, confidence: "medium", reason: "comparable cut, plainer band", metadata: { name: "Petite Solitaire", price: 640, category: "rings", image_url: ringDataUri("#d4b98c", "#fff9ec") } },
 ];
 
 function PlaceholderIcon() {
@@ -25,17 +58,37 @@ function PlaceholderIcon() {
   );
 }
 
-function ResultCard({ match }) {
+function CloudIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+      <path d="M6.5 18a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 17 8.06 4.5 4.5 0 0 1 16.5 17H6.5Z" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function ResultCard({ match, onImageClick }) {
   const [imageFailed, setImageFailed] = useState(false);
   const imageUrl = match.metadata?.image_url;
   const showImage = imageUrl && !imageFailed;
+  const fullUrl = showImage
+    ? (imageUrl.startsWith("http") || imageUrl.startsWith("data:") ? imageUrl : `${API_BASE}${imageUrl}`)
+    : null;
 
   return (
     <div className="result-card">
-      <div className="result-image" aria-hidden={!showImage}>
+      <div
+        className="result-image"
+        aria-hidden={!showImage}
+        role={showImage ? "button" : undefined}
+        tabIndex={showImage ? 0 : undefined}
+        onClick={() => showImage && onImageClick(fullUrl, match.metadata?.name || match.id)}
+        onKeyDown={(e) => {
+          if (showImage && (e.key === "Enter" || e.key === " ")) onImageClick(fullUrl, match.metadata?.name || match.id);
+        }}
+      >
         {showImage ? (
           <img
-            src={imageUrl.startsWith("http") ? imageUrl : `${API_BASE}${imageUrl}`}
+            src={fullUrl}
             alt={match.metadata?.name || match.id}
             onError={() => setImageFailed(true)}
           />
@@ -67,6 +120,30 @@ export function ShimmerLine() {
   return <div className="shimmer-line" aria-label="Searching" role="status" />;
 }
 
+function Lightbox({ image, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  if (!image) return null;
+
+  return (
+    <div className="lightbox-overlay" onClick={onClose}>
+      <button className="lightbox-close" onClick={onClose} aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+          <path d="M5 5l14 14M19 5L5 19" />
+        </svg>
+      </button>
+      <figure className="lightbox-figure" onClick={(e) => e.stopPropagation()}>
+        <img src={image.url} alt={image.label || "Jewel"} />
+        {image.label && <figcaption>{image.label}</figcaption>}
+      </figure>
+    </div>
+  );
+}
+
 export default function App() {
   const [messages, setMessages] = useState([
     { role: "assistant", type: "text", text: "Upload a photo of a piece you like, and I'll find the closest matches in the catalog." },
@@ -75,8 +152,10 @@ export default function App() {
   const [inputText, setInputText] = useState("");
   const [isSearching, setIsSearching] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [lightboxImage, setLightboxImage] = useState(null);
   const fileInputRef = useRef(null);
   const scrollRef = useRef(null);
+  const nextMsgId = useRef(1);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -92,15 +171,24 @@ export default function App() {
     if (!pendingImage) return;
     const imageUrl = pendingImage.url;
     const caption = inputText.trim();
+    const msgId = nextMsgId.current++;
 
     setMessages((m) => [
       ...m,
-      { role: "user", type: "image", imageUrl, caption },
+      { id: msgId, role: "user", type: "image", imageUrl, caption, archiveStatus: "saving" },
     ]);
     setIsSearching(true);
     setInputText("");
     const fileToSend = pendingImage.file;
     setPendingImage(null);
+
+    uploadQueryImage(fileToSend)
+      .then(() => {
+        setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "saved" } : msg)));
+      })
+      .catch(() => {
+        setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "error" } : msg)));
+      });
 
     try {
       const form = new FormData();
@@ -192,6 +280,24 @@ export default function App() {
           text-align: right;
         }
 
+        .archive-badge {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 5px;
+          margin: 6px 0 0;
+          font-size: 11px;
+          color: var(--ink-soft);
+        }
+        .archive-badge.saving { opacity: 0.6; }
+        .archive-badge.saving svg { animation: archive-pulse 1.1s ease-in-out infinite; }
+        .archive-badge.saved { color: var(--gold-1); }
+        .archive-badge.error { color: #B3492F; }
+        @keyframes archive-pulse {
+          0%, 100% { opacity: 0.4; }
+          50% { opacity: 1; }
+        }
+
         .results-row {
           display: flex;
           gap: 12px;
@@ -215,12 +321,70 @@ export default function App() {
           background: var(--bg);
           color: var(--gold-1);
           border-bottom: 1px solid var(--hairline);
+          cursor: pointer;
         }
         .result-image img {
           width: 100%;
           height: 100%;
           object-fit: cover;
         }
+
+        .clickable-image { cursor: pointer; }
+
+        .lightbox-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(10, 8, 6, 0.82);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+          padding: 40px 24px;
+          animation: lightbox-fade 0.15s ease;
+        }
+        @keyframes lightbox-fade {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+        .lightbox-figure {
+          margin: 0;
+          max-width: min(90vw, 720px);
+          max-height: 88vh;
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+        }
+        .lightbox-figure img {
+          max-width: 100%;
+          max-height: 80vh;
+          object-fit: contain;
+          border-radius: 6px;
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+          background: var(--surface);
+        }
+        .lightbox-figure figcaption {
+          margin-top: 12px;
+          color: #f2ece2;
+          font-family: 'Cormorant Garamond', serif;
+          font-size: 16px;
+          text-align: center;
+        }
+        .lightbox-close {
+          position: fixed;
+          top: 22px;
+          right: 26px;
+          width: 38px;
+          height: 38px;
+          border-radius: 50%;
+          border: 1px solid rgba(255, 255, 255, 0.35);
+          background: rgba(255, 255, 255, 0.08);
+          color: #f2ece2;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+        }
+        .lightbox-close:hover { background: rgba(255, 255, 255, 0.18); }
         .result-body { padding: 10px 11px 12px; }
         .result-name {
           font-family: 'Cormorant Garamond', serif;
@@ -367,14 +531,33 @@ export default function App() {
             {m.type === "text" && <div className="bubble-text">{m.text}</div>}
             {m.type === "image" && (
               <div className="user-image-block">
-                <img src={m.imageUrl} alt="Uploaded reference" />
+                <img
+                  src={m.imageUrl}
+                  alt="Uploaded reference"
+                  className="clickable-image"
+                  onClick={() => setLightboxImage({ url: m.imageUrl, label: "Your upload" })}
+                />
                 {m.caption && <p className="user-image-caption">{m.caption}</p>}
+                {m.archiveStatus && (
+                  <p className={`archive-badge ${m.archiveStatus}`}>
+                    <CloudIcon />
+                    {m.archiveStatus === "saving"
+                      ? "Saving to storage…"
+                      : m.archiveStatus === "error"
+                      ? "Couldn't save to storage"
+                      : "Saved to storage"}
+                  </p>
+                )}
               </div>
             )}
             {m.type === "results" && (
               <div className="results-row">
                 {m.matches.map((match) => (
-                  <ResultCard key={match.id} match={match} />
+                  <ResultCard
+                    key={match.id}
+                    match={match}
+                    onImageClick={(url, label) => setLightboxImage({ url, label })}
+                  />
                 ))}
               </div>
             )}
@@ -423,6 +606,8 @@ export default function App() {
           </button>
         </div>
       </div>
+
+      <Lightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
     </div>
   );
 }

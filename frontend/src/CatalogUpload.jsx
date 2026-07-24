@@ -96,6 +96,21 @@ function CatalogRow({ row, onChange, onRemove }) {
   );
 }
 
+function RecentThumb({ item }) {
+  const [failed, setFailed] = useState(false);
+  if (!item.image_url || failed) {
+    return <div className="recent-thumb recent-thumb-empty" />;
+  }
+  return (
+    <img
+      className="recent-thumb"
+      src={resolveImageUrl(item.image_url)}
+      alt={item.name}
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
 export default function CatalogUpload() {
   const [rows, setRows] = useState([]);
   const [bulkCategory, setBulkCategory] = useState("");
@@ -687,11 +702,7 @@ export default function CatalogUpload() {
                       {recentItems.map((item) => (
                         <tr key={item.item_id}>
                           <td>
-                            {item.image_url ? (
-                              <img className="recent-thumb" src={resolveImageUrl(item.image_url)} alt={item.name} />
-                            ) : (
-                              <div className="recent-thumb recent-thumb-empty" />
-                            )}
+                            <RecentThumb item={item} />
                           </td>
                           <td>{item.name || item.item_id}</td>
                           <td>{item.category || "—"}</td>
