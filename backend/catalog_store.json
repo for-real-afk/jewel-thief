@@ -1,0 +1,44 @@
+{
+  "green-earrings-jxdoyr": {
+    "filename": "4e066b2f4c5c2643d5949b9116585270.jpg",
+    "name": "green earrings",
+    "caption": "",
+    "description": "a enamel gold fusion dark green earrings",
+    "tags": [],
+    "category": "earrings",
+    "price": 10.0,
+    "image_url": "/static/catalog/green-earrings-jxdoyr.jpg",
+    "material": "enamel"
+  },
+  "rose-gold-diamond-ring-8i2nbl": {
+    "filename": "ring-gold-diamond.jpg",
+    "name": "Rose Gold Diamond Ring",
+    "caption": "",
+    "description": "",
+    "tags": [],
+    "category": "ring",
+    "price": 1450.0,
+    "image_url": "/static/catalog/rose-gold-diamond-ring-8i2nbl.jpg",
+    "material": "14k rose gold"
+  },
+  "freshwater-pearl-necklace-ik8i9l": {
+    "filename": "necklace-pearl.jpg",
+    "name": "Freshwater Pearl Necklace",
+    "caption": "",
+    "description": "",
+    "tags": [],
+    "category": "necklace",
+    "price": 620.0,
+    "image_url": "/static/catalog/freshwater-pearl-necklace-ik8i9l.jpg"
+  },
+  "byzantine-drop-earrings-3im6c8": {
+    "filename": "earrings-gemstone.jpg",
+    "name": "Byzantine Drop Earrings",
+    "caption": "",
+    "description": "",
+    "tags": [],
+    "category": "earrings",
+    "price": 890.0,
+    "image_url": "/static/catalog/byzantine-drop-earrings-3im6c8.jpg"
+  }
+}
