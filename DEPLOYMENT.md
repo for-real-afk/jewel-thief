@@ -29,7 +29,7 @@ Python runtime, health check at `/health`, every env var it needs).
 If not using the Blueprint: **New → Web Service**, connect the repo, then set:
 
 | Setting | Value |
-|---|---|
+| --- | --- |
 | Root Directory | `backend` |
 | Runtime | Python 3 |
 | Build Command | `pip install -r requirements.txt` |
@@ -46,32 +46,35 @@ supports both). It reads `$PORT` the same way the native runtime does.
 ### A real limitation: the filesystem is not persistent
 
 Render's default web service disk is **ephemeral** — wiped on every redeploy
-and on any restart after the free tier spins down from inactivity. Three
-things in this app currently write to local disk:
+and on any restart after the free tier spins down from inactivity. This bit
+in practice, twice: catalog images written at indexing time (via
+`POST /api/v1/catalog/index`) vanished after the next restart, breaking
+every thumbnail even though search itself kept working fine (the vectors +
+`image_url` metadata live in Pinecone, unaffected by a Render restart —
+only the actual image *files* were gone).
 
-- `backend/static/catalog/*.jpg` — persisted catalog photos, served back as
-  `image_url` in search results.
-- `backend/catalog_store.json` — the local mirror used by
-  `GET /api/v1/catalog/items` (see `README.md` §7 for why this exists instead
-  of reading Pinecone directly).
-- The in-memory `_jobs` dict (indexing job status) — not disk-based at all,
-  lost on every restart regardless.
+**Current fix**: `backend/static/catalog/*.jpg` (the full image set at time
+of writing) and `backend/catalog_store.json` are committed directly into the
+repo instead of being left as runtime-only state — see the "Catalog images
+are committed to the repo" note in `README.md` §7. They now ship with every
+deploy regardless of restarts.
 
-None of this breaks *search* — the actual vectors + metadata live in Pinecone,
-which is unaffected by a Render restart. What breaks: catalog images already
-uploaded will stop resolving (404) after a redeploy, since the files
-themselves are gone even though Pinecone still has `image_url` pointing at
-them, and the admin "Recently added" table will appear empty until the
-catalog is re-indexed. This was true and documented before deployment was in
-scope (see `README.md` §7, §11) — deploying to Render just makes the restart
-frequency high enough to matter in practice, rather than only "after a
-manual server restart."
+**This does not fully solve the underlying issue** — it only covers
+whatever was committed. Any *new* item added through the live `/catalog`
+admin page after that commit is still written only to the running
+container's disk, and is exactly as ephemeral as before: it'll disappear on
+the next restart unless someone commits it too (or reruns
+`backend/scripts/reindex_to_remote.py` against the live URL after a
+restart, which rewrites the same runtime state and has the same limitation).
+The in-memory `_jobs` dict (indexing job status) was never disk-based at all
+and is lost on every restart regardless of any of this.
 
-**If this matters for your use case**, the real fix is moving catalog images
-to actual object storage (S3, Cloudflare R2, Render Disks) and
-`catalog_store.json`/`_jobs` to a real database (Render Postgres, Redis) —
-sized as a follow-up, not done here, since it's a genuine architecture change
-rather than a deployment-config one.
+**The actual permanent fix**, if the catalog is expected to grow via the
+admin UI in normal operation (not just redeploy the current fixed set):
+move catalog images to real object storage (S3, Cloudflare R2, Render
+Disks) and `catalog_store.json`/`_jobs` to a real database (Render
+Postgres, Redis). Sized as a follow-up, not done here — it's a genuine
+architecture change, not a deployment-config one.
 
 ---
 
@@ -161,6 +164,7 @@ only testing in-app navigation.
 ## 5. What's already handled vs. what's a known gap
 
 **Handled by this deployment setup:**
+
 - Backend binds to Render's injected `$PORT`, not a hardcoded one.
 - `/health` wired up for Render's health checks.
 - CORS supports both exact origins and a regex, for Vercel's per-branch
@@ -169,11 +173,17 @@ only testing in-app navigation.
 - No secrets in the repo — `render.yaml` only stores non-secret config;
   every real credential is `sync: false` (Render prompts, stores encrypted)
   or set directly in Vercel's dashboard.
+- The catalog image set at time of writing is committed into the repo
+  (`backend/static/catalog/`), so it survives Render restarts — see §1 above.
 
 **Known gaps, not addressed here** (see `README.md` §11 and §1 above for
 detail — these are pre-existing architecture tradeoffs, not deployment bugs):
-- Catalog images, `catalog_store.json`, and in-memory job status don't
-  survive a Render restart/redeploy.
+
+- Any catalog item added through the live `/catalog` admin page *after* the
+  last commit of `backend/static/catalog/` is still runtime-only and does
+  not survive a restart/redeploy — only the committed set does.
+- The in-memory `_jobs` dict (indexing job status) is never disk-based and
+  is lost on every restart regardless.
 - Single backend instance only — the in-memory job dict and local JSON store
   aren't shared across multiple instances.
 - `BackgroundTasks` (in-process) rather than a real task queue — fine at

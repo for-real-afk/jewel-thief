@@ -329,6 +329,22 @@ Redis (or a real table) before running more than one backend instance — a seco
 instance, or a restart, simply won't see jobs or catalog entries another instance
 recorded.
 
+### Catalog images are committed to the repo
+
+`backend/static/catalog/*.jpg` (the served images) and `backend/catalog_store.json`
+are tracked in git, not ignored — a deliberate exception to "runtime state doesn't
+belong in the repo." This was forced by a real deployment problem: Render's disk is
+ephemeral (see `DEPLOYMENT.md` §1), so images written at indexing time vanished on
+every restart, breaking every thumbnail even though search itself kept working (the
+Pinecone vectors + `image_url` metadata are unaffected by a restart — only the actual
+image files were gone). Committing the current set means it ships with every deploy
+regardless of restarts.
+
+This only covers whatever was committed. Any item added through the live `/catalog`
+admin page afterward is still written only to the running container's disk and is
+exactly as ephemeral as before — see `DEPLOYMENT.md` §5 for the actual permanent fix
+(object storage) versus this stopgap.
+
 ---
 
 ## 8. Frontend architecture
