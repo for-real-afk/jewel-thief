@@ -102,7 +102,7 @@ function CloudIcon() {
   );
 }
 
-function ResultCard({ match, onImageClick, onMoreClick }) {
+function ResultCard({ match, onOpenDetail }) {
   const [imageFailed, setImageFailed] = useState(false);
   const imageUrl = match.metadata?.image_url;
   const showImage = imageUrl && !imageFailed;
@@ -113,23 +113,25 @@ function ResultCard({ match, onImageClick, onMoreClick }) {
   const hasDescription = Boolean(match.metadata?.description);
   const fullText = match.metadata?.description || match.reason;
   const { short, isTruncated } = truncateText(fullText, DESCRIPTION_PREVIEW_LENGTH);
+  const title = match.metadata?.name || match.id;
+
+  function openDetail() {
+    onOpenDetail({ imageUrl: fullUrl, title, text: fullText });
+  }
 
   return (
     <div className="result-card">
       <div
         className="result-image"
-        aria-hidden={!showImage}
-        role={showImage ? "button" : undefined}
-        tabIndex={showImage ? 0 : undefined}
-        onClick={() => showImage && onImageClick(fullUrl, match.metadata?.name || match.id)}
-        onKeyDown={(e) => {
-          if (showImage && (e.key === "Enter" || e.key === " ")) onImageClick(fullUrl, match.metadata?.name || match.id);
-        }}
+        role="button"
+        tabIndex={0}
+        onClick={openDetail}
+        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && openDetail()}
       >
         {showImage ? (
           <img
             src={fullUrl}
-            alt={match.metadata?.name || match.id}
+            alt={title}
             onError={() => setImageFailed(true)}
           />
         ) : (
@@ -137,7 +139,7 @@ function ResultCard({ match, onImageClick, onMoreClick }) {
         )}
       </div>
       <div className="result-body">
-        <p className="result-name">{match.metadata?.name || match.id}</p>
+        <p className="result-name">{title}</p>
         <p className="result-price">${match.metadata?.price?.toLocaleString?.() ?? "—"}</p>
         <div className="result-meter-row">
           <div className="result-meter-track">
@@ -154,11 +156,7 @@ function ResultCard({ match, onImageClick, onMoreClick }) {
           {isTruncated && (
             <>
               …{" "}
-              <button
-                type="button"
-                className="result-more-btn"
-                onClick={() => onMoreClick(fullText, match.metadata?.name || match.id)}
-              >
+              <button type="button" className="result-more-btn" onClick={openDetail}>
                 more
               </button>
             </>
@@ -197,27 +195,30 @@ function Lightbox({ image, onClose }) {
   );
 }
 
-function DescriptionModal({ description, onClose }) {
+function ItemModal({ item, onClose }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  if (!description) return null;
+  if (!item) return null;
 
   return (
     <div className="desc-modal-overlay" onClick={onClose}>
       <div className="desc-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="desc-modal-header">
-          <h3 className="desc-modal-title">{description.title}</h3>
-          <button className="desc-modal-close" onClick={onClose} aria-label="Close">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-              <path d="M5 5l14 14M19 5L5 19" />
-            </svg>
-          </button>
+        <button className="desc-modal-close" onClick={onClose} aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <path d="M5 5l14 14M19 5L5 19" />
+          </svg>
+        </button>
+        <div className="desc-modal-image">
+          {item.imageUrl ? <img src={item.imageUrl} alt={item.title} /> : <PlaceholderIcon />}
         </div>
-        <div className="desc-modal-body">{description.text}</div>
+        <div className="desc-modal-panel">
+          <h3 className="desc-modal-title">{item.title}</h3>
+          <div className="desc-modal-body">{item.text}</div>
+        </div>
       </div>
     </div>
   );
@@ -230,7 +231,7 @@ export default function App() {
   const [isSearching, setIsSearching] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [lightboxImage, setLightboxImage] = useState(null);
-  const [descriptionModal, setDescriptionModal] = useState(null);
+  const [detailModal, setDetailModal] = useState(null);
   const fileInputRef = useRef(null);
   const scrollRef = useRef(null);
   const nextMsgId = useRef(
@@ -574,48 +575,75 @@ export default function App() {
           padding: 24px;
         }
         .desc-modal {
+          position: relative;
           background: var(--surface);
           border-radius: 8px;
-          max-width: 420px;
+          max-width: 640px;
           width: 100%;
-          max-height: 70vh;
+          max-height: 78vh;
           display: flex;
-          flex-direction: column;
+          overflow: hidden;
           box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
         }
-        .desc-modal-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 12px;
-          padding: 16px 18px 10px;
-          border-bottom: 1px solid var(--hairline);
-        }
-        .desc-modal-title {
-          font-family: 'Cormorant Garamond', serif;
-          font-size: 17px;
-          font-weight: 600;
-          margin: 0;
-          color: var(--ink);
-        }
-        .desc-modal-close {
-          border: none;
-          background: none;
-          color: var(--ink-soft);
-          cursor: pointer;
-          flex-shrink: 0;
+        .desc-modal-image {
+          flex: 0 0 42%;
+          background: var(--bg);
+          color: var(--gold-1);
           display: flex;
           align-items: center;
           justify-content: center;
         }
+        .desc-modal-image img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+        .desc-modal-panel {
+          flex: 1;
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+          padding: 20px 22px;
+        }
+        .desc-modal-title {
+          font-family: 'Cormorant Garamond', serif;
+          font-size: 18px;
+          font-weight: 600;
+          margin: 0 0 12px;
+          padding-right: 26px;
+          color: var(--ink);
+          flex-shrink: 0;
+        }
+        .desc-modal-close {
+          position: absolute;
+          top: 12px;
+          right: 12px;
+          width: 28px;
+          height: 28px;
+          border-radius: 50%;
+          border: none;
+          background: var(--surface);
+          color: var(--ink-soft);
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          box-shadow: 0 1px 5px rgba(0, 0, 0, 0.2);
+          z-index: 1;
+        }
         .desc-modal-close:hover { color: var(--ink); }
         .desc-modal-body {
-          padding: 14px 18px 18px;
+          flex: 1;
+          min-height: 0;
           overflow-y: auto;
           font-size: 13.5px;
           line-height: 1.6;
           color: var(--ink-soft);
           white-space: pre-wrap;
+        }
+        @media (max-width: 560px) {
+          .desc-modal { flex-direction: column; max-height: 85vh; }
+          .desc-modal-image { flex: 0 0 200px; }
         }
 
         .composer {
@@ -748,12 +776,7 @@ export default function App() {
             {m.type === "results" && (
               <div className="results-row">
                 {m.matches.map((match) => (
-                  <ResultCard
-                    key={match.id}
-                    match={match}
-                    onImageClick={(url, label) => setLightboxImage({ url, label })}
-                    onMoreClick={(text, title) => setDescriptionModal({ text, title })}
-                  />
+                  <ResultCard key={match.id} match={match} onOpenDetail={setDetailModal} />
                 ))}
               </div>
             )}
@@ -804,7 +827,7 @@ export default function App() {
       </div>
 
       <Lightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
-      <DescriptionModal description={descriptionModal} onClose={() => setDescriptionModal(null)} />
+      <ItemModal item={detailModal} onClose={() => setDetailModal(null)} />
     </div>
   );
 }
