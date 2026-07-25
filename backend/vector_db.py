@@ -37,6 +37,19 @@ def upsert_batch(items: list[dict]) -> int:
     return count
 
 
+def update_metadata(item_id: str, metadata: dict) -> None:
+    """Replace an existing vector's metadata in place, without touching its
+    embedding — used for metadata-only catalog edits (no new image), so an
+    edit doesn't cost a re-embedding call for a vector that hasn't changed."""
+    index = get_or_create_index()
+    index.update(id=item_id, set_metadata=metadata)
+
+
+def delete_by_id(item_id: str) -> None:
+    index = get_or_create_index()
+    index.delete(ids=[item_id])
+
+
 @external_api_retry
 def search(
     query_vector: list[float],

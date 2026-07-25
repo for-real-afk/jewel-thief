@@ -440,3 +440,166 @@ def test_catalog_items_clamps_limit_to_reasonable_bounds(mocker):
     client.get("/api/v1/catalog/items", params={"limit": 1000}, headers={"x-api-key": VALID_KEY})
 
     assert mock_list.call_args.kwargs["limit"] == 100
+
+
+def test_get_catalog_item_requires_api_key():
+    resp = client.get("/api/v1/catalog/items/id-1")
+    assert resp.status_code == 401
+
+
+def test_get_catalog_item_returns_404_for_unknown_id(mocker):
+    mocker.patch.object(main.catalog_store, "get_item", return_value=None)
+    resp = client.get("/api/v1/catalog/items/does-not-exist", headers={"x-api-key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_get_catalog_item_happy_path(mocker):
+    mocker.patch.object(
+        main.catalog_store, "get_item", return_value={"item_id": "id-1", "name": "Ring", "price": 100.0}
+    )
+    resp = client.get("/api/v1/catalog/items/id-1", headers={"x-api-key": VALID_KEY})
+    assert resp.status_code == 200
+    assert resp.json() == {"item_id": "id-1", "name": "Ring", "price": 100.0}
+
+
+def _edit_fields(**overrides):
+    fields = {"name": "Updated Ring", "category": "ring", "price": 150.0}
+    fields.update(overrides)
+    return fields
+
+
+def test_update_catalog_item_requires_api_key():
+    resp = client.patch("/api/v1/catalog/items/id-1", data={"fields": json.dumps(_edit_fields())})
+    assert resp.status_code == 401
+
+
+def test_update_catalog_item_returns_404_for_unknown_id(mocker):
+    mocker.patch.object(main.catalog_store, "get_item", return_value=None)
+    resp = client.patch(
+        "/api/v1/catalog/items/does-not-exist",
+        data={"fields": json.dumps(_edit_fields())},
+        headers={"x-api-key": VALID_KEY},
+    )
+    assert resp.status_code == 404
+
+
+def test_update_catalog_item_invalid_json_returns_400(mocker):
+    mocker.patch.object(main.catalog_store, "get_item", return_value=_item("id-1"))
+    resp = client.patch(
+        "/api/v1/catalog/items/id-1",
+        data={"fields": "{not valid json"},
+        headers={"x-api-key": VALID_KEY},
+    )
+    assert resp.status_code == 400
+
+
+def test_update_catalog_item_missing_required_field_returns_400(mocker):
+    mocker.patch.object(main.catalog_store, "get_item", return_value=_item("id-1"))
+    resp = client.patch(
+        "/api/v1/catalog/items/id-1",
+        data={"fields": json.dumps({"name": "Ring"})},  # missing category, price
+        headers={"x-api-key": VALID_KEY},
+    )
+    assert resp.status_code == 400
+
+
+def test_update_catalog_item_metadata_only_skips_reembedding_and_reuses_existing_image(mocker):
+    mocker.patch.object(
+        main.catalog_store, "get_item",
+        return_value={
+            "item_id": "id-1", "filename": "old.jpg", "image_url": "/static/catalog/id-1.jpg",
+            "name": "Ring", "category": "ring", "price": 100.0,
+        },
+    )
+    mock_update_metadata = mocker.patch.object(main.vector_db, "update_metadata")
+    mock_upsert = mocker.patch.object(main.vector_db, "upsert_batch")
+    mock_embed = mocker.patch.object(main.embeddings, "embed_catalog_image")
+    mock_record = mocker.patch.object(main.catalog_store, "record_item")
+
+    resp = client.patch(
+        "/api/v1/catalog/items/id-1",
+        data={"fields": json.dumps(_edit_fields(name="Renamed Ring", price=200))},
+        headers={"x-api-key": VALID_KEY},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["name"] == "Renamed Ring"
+    assert body["price"] == 200.0
+    assert body["image_url"] == "/static/catalog/id-1.jpg"  # unchanged
+
+    mock_embed.assert_not_called()
+    mock_upsert.assert_not_called()
+    mock_update_metadata.assert_called_once()
+    assert mock_update_metadata.call_args.args[0] == "id-1"
+    mock_record.assert_called_once_with("id-1", mock_update_metadata.call_args.args[1])
+
+
+def test_update_catalog_item_with_new_image_reembeds_and_overwrites_file(mocker, valid_jpeg_bytes, tmp_path):
+    mocker.patch.object(main, "CATALOG_IMAGE_DIR", tmp_path)
+    mocker.patch.object(
+        main.catalog_store, "get_item",
+        return_value={
+            "item_id": "id-1", "filename": "old.jpg", "image_url": "/static/catalog/id-1.jpg",
+            "name": "Ring", "category": "ring", "price": 100.0,
+        },
+    )
+    mocker.patch.object(main.embeddings, "embed_catalog_image", return_value=[0.2] * 8)
+    mock_upsert = mocker.patch.object(main.vector_db, "upsert_batch")
+    mock_update_metadata = mocker.patch.object(main.vector_db, "update_metadata")
+    mocker.patch.object(main.catalog_store, "record_item")
+
+    resp = client.patch(
+        "/api/v1/catalog/items/id-1",
+        data={"fields": json.dumps(_edit_fields())},
+        files={"image": ("new.jpg", valid_jpeg_bytes, "image/jpeg")},
+        headers={"x-api-key": VALID_KEY},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["filename"] == "new.jpg"
+    assert body["image_url"] == "/static/catalog/id-1.jpg"
+
+    mock_update_metadata.assert_not_called()
+    mock_upsert.assert_called_once()
+    assert mock_upsert.call_args.args[0][0]["id"] == "id-1"
+    assert mock_upsert.call_args.args[0][0]["vector"] == [0.2] * 8
+    assert (tmp_path / "id-1.jpg").exists()
+
+
+def test_delete_catalog_item_requires_api_key():
+    resp = client.delete("/api/v1/catalog/items/id-1")
+    assert resp.status_code == 401
+
+
+def test_delete_catalog_item_returns_404_for_unknown_id(mocker):
+    mocker.patch.object(main.catalog_store, "get_item", return_value=None)
+    resp = client.delete("/api/v1/catalog/items/does-not-exist", headers={"x-api-key": VALID_KEY})
+    assert resp.status_code == 404
+
+
+def test_delete_catalog_item_happy_path_removes_vector_row_and_image(mocker, tmp_path):
+    mocker.patch.object(main, "CATALOG_IMAGE_DIR", tmp_path)
+    (tmp_path / "id-1.jpg").write_bytes(b"fake image bytes")
+    mocker.patch.object(main.catalog_store, "get_item", return_value=_item("id-1"))
+    mock_delete_vector = mocker.patch.object(main.vector_db, "delete_by_id")
+    mock_delete_row = mocker.patch.object(main.catalog_store, "delete_item")
+
+    resp = client.delete("/api/v1/catalog/items/id-1", headers={"x-api-key": VALID_KEY})
+
+    assert resp.status_code == 204
+    mock_delete_vector.assert_called_once_with("id-1")
+    mock_delete_row.assert_called_once_with("id-1")
+    assert not (tmp_path / "id-1.jpg").exists()
+
+
+def test_delete_catalog_item_missing_image_file_does_not_error(mocker, tmp_path):
+    mocker.patch.object(main, "CATALOG_IMAGE_DIR", tmp_path)
+    mocker.patch.object(main.catalog_store, "get_item", return_value=_item("id-1"))
+    mocker.patch.object(main.vector_db, "delete_by_id")
+    mocker.patch.object(main.catalog_store, "delete_item")
+
+    resp = client.delete("/api/v1/catalog/items/id-1", headers={"x-api-key": VALID_KEY})
+
+    assert resp.status_code == 204
