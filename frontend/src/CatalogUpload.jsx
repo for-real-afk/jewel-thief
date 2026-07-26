@@ -111,6 +111,104 @@ function RecentThumb({ item }) {
   );
 }
 
+function fieldsToForm(item) {
+  return {
+    name: item.name || "",
+    category: item.category || "",
+    price: item.price != null ? String(item.price) : "",
+    material: item.material || "",
+    caption: item.caption || "",
+    description: item.description || "",
+    tagsInput: Array.isArray(item.tags) ? item.tags.join(", ") : "",
+  };
+}
+
+function EditItemModal({ itemId, fields, imagePreviewUrl, saving, error, onChange, onImageChosen, onCancel, onSave }) {
+  const errors = validateRow(fields);
+  return (
+    <div className="edit-overlay" onClick={onCancel}>
+      <div className="edit-modal" onClick={(e) => e.stopPropagation()}>
+        <h3 className="edit-title">Edit {itemId}</h3>
+        <div className="row-card edit-row-card">
+          <div className="edit-image-col">
+            <img className="row-thumb" src={imagePreviewUrl} alt={fields.name || itemId} />
+            <label className="dropzone-browse edit-replace-image">
+              Replace photo
+              <input
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={(e) => {
+                  if (e.target.files?.[0]) onImageChosen(e.target.files[0]);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+          </div>
+          <div className="row-fields">
+            <div className="row-fields-grid">
+              <div className="field">
+                <label>Name *</label>
+                <input value={fields.name} onChange={(e) => onChange("name", e.target.value)} />
+                {errors.name && <span className="field-error">{errors.name}</span>}
+              </div>
+              <div className="field">
+                <label>Category *</label>
+                <input list="category-options" value={fields.category} onChange={(e) => onChange("category", e.target.value)} />
+                {errors.category && <span className="field-error">{errors.category}</span>}
+              </div>
+              <div className="field">
+                <label>Price *</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={fields.price}
+                  onChange={(e) => onChange("price", e.target.value)}
+                />
+                {errors.price && <span className="field-error">{errors.price}</span>}
+              </div>
+              <div className="field">
+                <label>Material</label>
+                <input value={fields.material} onChange={(e) => onChange("material", e.target.value)} />
+              </div>
+            </div>
+            <div className="field">
+              <label>Caption</label>
+              <input value={fields.caption} onChange={(e) => onChange("caption", e.target.value)} />
+            </div>
+            <div className="field">
+              <label>Description</label>
+              <textarea rows={2} value={fields.description} onChange={(e) => onChange("description", e.target.value)} />
+            </div>
+            <div className="field">
+              <label>Tags (comma-separated)</label>
+              <input value={fields.tagsInput} onChange={(e) => onChange("tagsInput", e.target.value)} />
+            </div>
+          </div>
+        </div>
+        {error && <p className="inline-error">{error}</p>}
+        <div className="edit-actions">
+          <button type="button" className="bulk-apply-btn" onClick={onCancel} disabled={saving}>
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="submit-btn"
+            onClick={() => {
+              if (Object.keys(errors).length > 0) return;
+              onSave();
+            }}
+            disabled={saving}
+          >
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function CatalogUpload() {
   const [rows, setRows] = useState([]);
   const [bulkCategory, setBulkCategory] = useState("");
@@ -127,6 +225,14 @@ export default function CatalogUpload() {
   const [recentLoading, setRecentLoading] = useState(false);
   const [recentError, setRecentError] = useState(null);
   const [recentCollapsed, setRecentCollapsed] = useState(false);
+
+  const [editingItem, setEditingItem] = useState(null); // {itemId, imageUrl, fields}
+  const [editImageFile, setEditImageFile] = useState(null);
+  const [editImagePreview, setEditImagePreview] = useState(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+  const [rowError, setRowError] = useState(null);
 
   const fileInputRef = useRef(null);
   const pollTimeoutRef = useRef(null);
@@ -288,6 +394,102 @@ export default function CatalogUpload() {
     } catch {
       setSubmitState("error");
       setSubmitError("Lost connection while checking indexing progress.");
+    }
+  }
+
+  async function openEdit(item) {
+    setRowError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/catalog/items/${encodeURIComponent(item.item_id)}`, {
+        headers: { "x-api-key": API_KEY },
+      });
+      if (!res.ok) throw new Error(`Couldn't load item details (${res.status})`);
+      const full = await res.json();
+      setEditingItem({ itemId: full.item_id, imageUrl: full.image_url, fields: fieldsToForm(full) });
+      setEditImageFile(null);
+      setEditImagePreview(resolveImageUrl(full.image_url));
+      setEditError(null);
+    } catch (err) {
+      setRowError(err.message);
+    }
+  }
+
+  function closeEdit() {
+    if (editImageFile) URL.revokeObjectURL(editImagePreview);
+    setEditingItem(null);
+    setEditImageFile(null);
+    setEditImagePreview(null);
+    setEditError(null);
+  }
+
+  function updateEditField(field, value) {
+    setEditingItem((cur) => ({ ...cur, fields: { ...cur.fields, [field]: value } }));
+  }
+
+  function chooseEditImage(file) {
+    setEditImageFile(file);
+    setEditImagePreview(URL.createObjectURL(file));
+  }
+
+  async function saveEdit() {
+    if (!editingItem) return;
+    setEditSaving(true);
+    setEditError(null);
+
+    const { fields } = editingItem;
+    const payload = {
+      name: fields.name.trim(),
+      category: fields.category.trim(),
+      price: parseFloat(fields.price),
+      caption: fields.caption.trim(),
+      description: fields.description.trim(),
+      tags: fields.tagsInput.split(",").map((t) => t.trim()).filter(Boolean),
+      ...(fields.material.trim() ? { material: fields.material.trim() } : {}),
+    };
+
+    const form = new FormData();
+    form.append("fields", JSON.stringify(payload));
+    if (editImageFile) form.append("image", editImageFile);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/catalog/items/${encodeURIComponent(editingItem.itemId)}`, {
+        method: "PATCH",
+        headers: { "x-api-key": API_KEY },
+        body: form,
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        const detail = body?.detail;
+        throw new Error(typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : `Request failed (${res.status})`);
+      }
+      closeEdit();
+      loadRecentItems(recentOffset);
+    } catch (err) {
+      setEditError(err.message);
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function handleDelete(item) {
+    if (!window.confirm(`Delete "${item.name || item.item_id}" from the catalog? This can't be undone.`)) return;
+    setDeletingId(item.item_id);
+    setRowError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/catalog/items/${encodeURIComponent(item.item_id)}`, {
+        method: "DELETE",
+        headers: { "x-api-key": API_KEY },
+      });
+      if (!res.ok && res.status !== 204) throw new Error(`Delete failed (${res.status})`);
+
+      // Step back a page if we just deleted the last item on the current one.
+      const nextOffset = recentItems.length === 1 && recentOffset > 0 ? recentOffset - RECENT_LIMIT : recentOffset;
+      if (nextOffset !== recentOffset) setRecentOffset(nextOffset);
+      else loadRecentItems(recentOffset);
+    } catch (err) {
+      setRowError(err.message);
+    } finally {
+      setDeletingId(null);
     }
   }
 
@@ -557,6 +759,71 @@ export default function CatalogUpload() {
           opacity: 0.4;
           cursor: default;
         }
+
+        .recent-actions {
+          text-align: right;
+          white-space: nowrap;
+        }
+        .row-action-btn {
+          border: 1px solid var(--hairline);
+          border-radius: 4px;
+          background: var(--surface);
+          padding: 4px 10px;
+          font-size: 12px;
+          cursor: pointer;
+          color: var(--ink);
+          margin-left: 6px;
+        }
+        .row-action-btn:hover { border-color: var(--gold-2); }
+        .row-action-btn:disabled { opacity: 0.5; cursor: default; }
+        .row-action-danger { color: #B3492F; }
+        .row-action-danger:hover { border-color: #B3492F; }
+
+        .edit-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(0, 0, 0, 0.45);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 20px;
+          z-index: 100;
+        }
+        .edit-modal {
+          background: var(--surface);
+          border-radius: 8px;
+          padding: 20px;
+          max-width: 720px;
+          width: 100%;
+          max-height: 90vh;
+          overflow-y: auto;
+        }
+        .edit-title {
+          font-family: 'Cormorant Garamond', serif;
+          font-size: 19px;
+          font-weight: 600;
+          margin: 0 0 14px;
+          color: var(--ink);
+        }
+        .edit-row-card { border: none; padding: 0; }
+        .edit-image-col {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          gap: 8px;
+          flex-shrink: 0;
+        }
+        .edit-image-col .row-thumb { width: 96px; height: 96px; }
+        .edit-replace-image {
+          font-size: 11px;
+          text-align: center;
+        }
+        .edit-actions {
+          display: flex;
+          justify-content: flex-end;
+          gap: 10px;
+          margin-top: 16px;
+        }
       `}</style>
 
       <TopNav />
@@ -686,6 +953,7 @@ export default function CatalogUpload() {
           {!recentCollapsed && (
             <div className="recent-body">
               {recentError && <p className="inline-error">{recentError}</p>}
+              {rowError && <p className="inline-error">{rowError}</p>}
               {recentLoading && <ShimmerLine />}
               {!recentLoading && !recentError && (
                 <>
@@ -696,6 +964,7 @@ export default function CatalogUpload() {
                         <th>Name</th>
                         <th>Category</th>
                         <th>Price</th>
+                        <th></th>
                       </tr>
                     </thead>
                     <tbody>
@@ -707,11 +976,24 @@ export default function CatalogUpload() {
                           <td>{item.name || item.item_id}</td>
                           <td>{item.category || "—"}</td>
                           <td>{item.price != null ? `$${Number(item.price).toLocaleString()}` : "—"}</td>
+                          <td className="recent-actions">
+                            <button type="button" className="row-action-btn" onClick={() => openEdit(item)}>
+                              Edit
+                            </button>
+                            <button
+                              type="button"
+                              className="row-action-btn row-action-danger"
+                              onClick={() => handleDelete(item)}
+                              disabled={deletingId === item.item_id}
+                            >
+                              {deletingId === item.item_id ? "Deleting…" : "Delete"}
+                            </button>
+                          </td>
                         </tr>
                       ))}
                       {recentItems.length === 0 && (
                         <tr>
-                          <td colSpan={4} className="recent-empty">
+                          <td colSpan={5} className="recent-empty">
                             No catalog items yet.
                           </td>
                         </tr>
@@ -745,6 +1027,20 @@ export default function CatalogUpload() {
           )}
         </section>
       </main>
+
+      {editingItem && (
+        <EditItemModal
+          itemId={editingItem.itemId}
+          fields={editingItem.fields}
+          imagePreviewUrl={editImagePreview}
+          saving={editSaving}
+          error={editError}
+          onChange={updateEditField}
+          onImageChosen={chooseEditImage}
+          onCancel={closeEdit}
+          onSave={saveEdit}
+        />
+      )}
     </div>
   );
 }

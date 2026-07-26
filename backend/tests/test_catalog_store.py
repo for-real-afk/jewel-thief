@@ -17,6 +17,7 @@ class _FakeTable:
         self._op = None
         self._desc = False
         self._range = None
+        self._eq_value = None
 
     def upsert(self, row):
         self._op = "upsert"
@@ -25,6 +26,14 @@ class _FakeTable:
 
     def select(self, columns, count=None):
         self._op = "select"
+        return self
+
+    def delete(self):
+        self._op = "delete"
+        return self
+
+    def eq(self, column, value):
+        self._eq_value = value
         return self
 
     def order(self, column, desc=False):
@@ -40,7 +49,13 @@ class _FakeTable:
             self._store[self._row["item_id"]] = self._row
             return _FakeResult([self._row], None)
 
+        if self._op == "delete":
+            self._store.pop(self._eq_value, None)
+            return _FakeResult([], None)
+
         rows = list(self._store.values())
+        if self._eq_value is not None:
+            rows = [r for r in rows if r["item_id"] == self._eq_value]
         if self._desc:
             rows = list(reversed(rows))
         total = len(rows)
@@ -114,3 +129,36 @@ def test_list_items_on_empty_store_returns_empty():
 
     assert items == []
     assert total == 0
+
+
+def test_get_item_returns_matching_item():
+    catalog_store.record_item("id-1", {"name": "Ring"})
+    catalog_store.record_item("id-2", {"name": "Necklace"})
+
+    item = catalog_store.get_item("id-2")
+
+    assert item == {"item_id": "id-2", "name": "Necklace"}
+
+
+def test_get_item_returns_none_for_unknown_id():
+    assert catalog_store.get_item("does-not-exist") is None
+
+
+def test_delete_item_removes_only_the_matching_item():
+    catalog_store.record_item("id-1", {"name": "Ring"})
+    catalog_store.record_item("id-2", {"name": "Necklace"})
+
+    catalog_store.delete_item("id-1")
+
+    items, total = catalog_store.list_items(limit=10, offset=0)
+    assert total == 1
+    assert items[0]["item_id"] == "id-2"
+
+
+def test_delete_item_on_unknown_id_is_a_no_op():
+    catalog_store.record_item("id-1", {"name": "Ring"})
+
+    catalog_store.delete_item("does-not-exist")
+
+    _, total = catalog_store.list_items(limit=10, offset=0)
+    assert total == 1

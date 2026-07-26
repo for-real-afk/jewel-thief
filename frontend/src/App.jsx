@@ -4,6 +4,22 @@ import TopNav from "./TopNav.jsx";
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const API_KEY = import.meta.env.VITE_API_KEY || "";
 
+const CHAT_STORAGE_KEY = "facet_chat_messages";
+const DEFAULT_MESSAGES = [
+  { role: "assistant", type: "text", text: "Upload a photo of a piece you like, or describe it in words, and I'll find the closest matches in the catalog." },
+];
+
+function loadStoredMessages() {
+  try {
+    const raw = sessionStorage.getItem(CHAT_STORAGE_KEY);
+    if (!raw) return DEFAULT_MESSAGES;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : DEFAULT_MESSAGES;
+  } catch {
+    return DEFAULT_MESSAGES;
+  }
+}
+
 // Archives the user's query image to object storage (S3) via a backend-issued
 // pre-signed URL, so the browser never holds AWS credentials directly.
 async function uploadQueryImage(file) {
@@ -21,6 +37,19 @@ async function uploadQueryImage(file) {
     body: file,
   });
   if (!putRes.ok) throw new Error("upload to storage failed");
+}
+
+// Object URLs (URL.createObjectURL) only live as long as the page does, so a
+// chat bubble holding one can't survive a reload. Converting to a base64
+// data URL trades a larger sessionStorage footprint for a self-contained
+// string that reload can actually restore.
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
 }
 
 // Generates a simple ring illustration entirely locally (no network fetch) so
@@ -58,6 +87,13 @@ function PlaceholderIcon() {
   );
 }
 
+const DESCRIPTION_PREVIEW_LENGTH = 90;
+
+function truncateText(text, maxLength) {
+  if (!text || text.length <= maxLength) return { short: text, isTruncated: false };
+  return { short: text.slice(0, maxLength).trimEnd(), isTruncated: true };
+}
+
 function CloudIcon() {
   return (
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
@@ -66,7 +102,7 @@ function CloudIcon() {
   );
 }
 
-function ResultCard({ match, onImageClick }) {
+function ResultCard({ match, onOpenDetail }) {
   const [imageFailed, setImageFailed] = useState(false);
   const imageUrl = match.metadata?.image_url;
   const showImage = imageUrl && !imageFailed;
@@ -74,22 +110,28 @@ function ResultCard({ match, onImageClick }) {
     ? (imageUrl.startsWith("http") || imageUrl.startsWith("data:") ? imageUrl : `${API_BASE}${imageUrl}`)
     : null;
 
+  const hasDescription = Boolean(match.metadata?.description);
+  const fullText = match.metadata?.description || match.reason;
+  const { short, isTruncated } = truncateText(fullText, DESCRIPTION_PREVIEW_LENGTH);
+  const title = match.metadata?.name || match.id;
+
+  function openDetail() {
+    onOpenDetail({ imageUrl: fullUrl, title, text: fullText });
+  }
+
   return (
     <div className="result-card">
       <div
         className="result-image"
-        aria-hidden={!showImage}
-        role={showImage ? "button" : undefined}
-        tabIndex={showImage ? 0 : undefined}
-        onClick={() => showImage && onImageClick(fullUrl, match.metadata?.name || match.id)}
-        onKeyDown={(e) => {
-          if (showImage && (e.key === "Enter" || e.key === " ")) onImageClick(fullUrl, match.metadata?.name || match.id);
-        }}
+        role="button"
+        tabIndex={0}
+        onClick={openDetail}
+        onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && openDetail()}
       >
         {showImage ? (
           <img
             src={fullUrl}
-            alt={match.metadata?.name || match.id}
+            alt={title}
             onError={() => setImageFailed(true)}
           />
         ) : (
@@ -97,7 +139,7 @@ function ResultCard({ match, onImageClick }) {
         )}
       </div>
       <div className="result-body">
-        <p className="result-name">{match.metadata?.name || match.id}</p>
+        <p className="result-name">{title}</p>
         <p className="result-price">${match.metadata?.price?.toLocaleString?.() ?? "—"}</p>
         <div className="result-meter-row">
           <div className="result-meter-track">
@@ -109,7 +151,16 @@ function ResultCard({ match, onImageClick }) {
           <span className="result-percent">{match.similarity_percent}%</span>
         </div>
         <p className={`result-confidence confidence-${match.confidence}`}>
-          {match.confidence} confidence — {match.reason}
+          {!hasDescription && <>{match.confidence} confidence — </>}
+          {short}
+          {isTruncated && (
+            <>
+              …{" "}
+              <button type="button" className="result-more-btn" onClick={openDetail}>
+                more
+              </button>
+            </>
+          )}
         </p>
       </div>
     </div>
@@ -144,22 +195,68 @@ function Lightbox({ image, onClose }) {
   );
 }
 
+function ItemModal({ item, onClose }) {
+  useEffect(() => {
+    const onKey = (e) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  if (!item) return null;
+
+  return (
+    <div className="desc-modal-overlay" onClick={onClose}>
+      <div className="desc-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="desc-modal-close" onClick={onClose} aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+            <path d="M5 5l14 14M19 5L5 19" />
+          </svg>
+        </button>
+        <div className="desc-modal-image">
+          {item.imageUrl ? <img src={item.imageUrl} alt={item.title} /> : <PlaceholderIcon />}
+        </div>
+        <div className="desc-modal-panel">
+          <h3 className="desc-modal-title">{item.title}</h3>
+          <div className="desc-modal-body">{item.text}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
-  const [messages, setMessages] = useState([
-    { role: "assistant", type: "text", text: "Upload a photo of a piece you like, or describe it in words, and I'll find the closest matches in the catalog." },
-  ]);
+  const [messages, setMessages] = useState(loadStoredMessages);
   const [pendingImage, setPendingImage] = useState(null);
   const [inputText, setInputText] = useState("");
   const [isSearching, setIsSearching] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [lightboxImage, setLightboxImage] = useState(null);
+  const [detailModal, setDetailModal] = useState(null);
   const fileInputRef = useRef(null);
   const scrollRef = useRef(null);
-  const nextMsgId = useRef(1);
+  const nextMsgId = useRef(
+    Math.max(0, ...messages.filter((m) => typeof m.id === "number").map((m) => m.id)) + 1
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, isSearching]);
+
+  useEffect(() => {
+    // imageUrl is normally swapped from a blob: URL to a data: URL shortly
+    // after send (see runSearch) -- data: URLs persist fine, but null out
+    // any blob: URL still in flight so a restored bubble doesn't show a
+    // broken image instead of the placeholder.
+    const persistable = messages.map((m) =>
+      m.type === "image" && m.imageUrl?.startsWith("blob:") ? { ...m, imageUrl: null } : m
+    );
+    try {
+      sessionStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(persistable));
+    } catch {
+      // sessionStorage full or unavailable (e.g. private browsing) -- this
+      // persistence is a nice-to-have, not worth surfacing an error for.
+    }
+  }, [messages]);
 
   function handleFileChosen(file) {
     if (!file || !file.type.startsWith("image/")) return;
@@ -190,6 +287,19 @@ export default function App() {
         })
         .catch(() => {
           setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "error" } : msg)));
+        });
+
+      // Swap the (page-lifetime-only) object URL for a durable data URL so
+      // this bubble's photo survives a refresh — independent of whether the
+      // S3 archive above succeeds.
+      fileToDataUrl(image.file)
+        .then((dataUrl) => {
+          setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, imageUrl: dataUrl } : msg)));
+          URL.revokeObjectURL(image.url);
+        })
+        .catch(() => {
+          // Keep the blob: URL -- image still displays for this page's
+          // lifetime, it just won't survive a reload (see the persist effect).
         });
     }
 
@@ -279,6 +389,15 @@ export default function App() {
           border-radius: 4px;
           border: 1px solid var(--hairline);
           display: block;
+        }
+        .user-image-placeholder {
+          width: 220px;
+          padding: 14px;
+          border: 1px dashed var(--hairline);
+          border-radius: 4px;
+          font-size: 12px;
+          color: var(--ink-soft);
+          text-align: center;
         }
         .user-image-caption {
           font-size: 13px;
@@ -433,6 +552,99 @@ export default function App() {
           color: var(--ink-soft);
         }
         .confidence-high { color: var(--gold-1); }
+        .result-more-btn {
+          border: none;
+          background: none;
+          padding: 0;
+          margin: 0;
+          font: inherit;
+          font-size: 11px;
+          text-decoration: underline;
+          color: inherit;
+          cursor: pointer;
+        }
+
+        .desc-modal-overlay {
+          position: fixed;
+          inset: 0;
+          background: rgba(10, 8, 6, 0.5);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 1000;
+          padding: 24px;
+        }
+        .desc-modal {
+          position: relative;
+          background: var(--surface);
+          border-radius: 8px;
+          max-width: 640px;
+          width: 100%;
+          max-height: 78vh;
+          display: flex;
+          overflow: hidden;
+          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+        }
+        .desc-modal-image {
+          flex: 0 0 42%;
+          background: var(--bg);
+          color: var(--gold-1);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .desc-modal-image img {
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+        }
+        .desc-modal-panel {
+          flex: 1;
+          min-width: 0;
+          display: flex;
+          flex-direction: column;
+          padding: 20px 22px;
+        }
+        .desc-modal-title {
+          font-family: 'Cormorant Garamond', serif;
+          font-size: 18px;
+          font-weight: 600;
+          margin: 0 0 12px;
+          padding-right: 26px;
+          color: var(--ink);
+          flex-shrink: 0;
+        }
+        .desc-modal-close {
+          position: absolute;
+          top: 12px;
+          right: 12px;
+          width: 28px;
+          height: 28px;
+          border-radius: 50%;
+          border: none;
+          background: var(--surface);
+          color: var(--ink-soft);
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          box-shadow: 0 1px 5px rgba(0, 0, 0, 0.2);
+          z-index: 1;
+        }
+        .desc-modal-close:hover { color: var(--ink); }
+        .desc-modal-body {
+          flex: 1;
+          min-height: 0;
+          overflow-y: auto;
+          font-size: 13.5px;
+          line-height: 1.6;
+          color: var(--ink-soft);
+          white-space: pre-wrap;
+        }
+        @media (max-width: 560px) {
+          .desc-modal { flex-direction: column; max-height: 85vh; }
+          .desc-modal-image { flex: 0 0 200px; }
+        }
 
         .composer {
           width: 100%;
@@ -538,12 +750,16 @@ export default function App() {
             {m.type === "text" && <div className="bubble-text">{m.text}</div>}
             {m.type === "image" && (
               <div className="user-image-block">
-                <img
-                  src={m.imageUrl}
-                  alt="Uploaded reference"
-                  className="clickable-image"
-                  onClick={() => setLightboxImage({ url: m.imageUrl, label: "Your upload" })}
-                />
+                {m.imageUrl ? (
+                  <img
+                    src={m.imageUrl}
+                    alt="Uploaded reference"
+                    className="clickable-image"
+                    onClick={() => setLightboxImage({ url: m.imageUrl, label: "Your upload" })}
+                  />
+                ) : (
+                  <div className="user-image-placeholder">Photo you uploaded (not kept after refresh)</div>
+                )}
                 {m.caption && <p className="user-image-caption">{m.caption}</p>}
                 {m.archiveStatus && (
                   <p className={`archive-badge ${m.archiveStatus}`}>
@@ -560,11 +776,7 @@ export default function App() {
             {m.type === "results" && (
               <div className="results-row">
                 {m.matches.map((match) => (
-                  <ResultCard
-                    key={match.id}
-                    match={match}
-                    onImageClick={(url, label) => setLightboxImage({ url, label })}
-                  />
+                  <ResultCard key={match.id} match={match} onOpenDetail={setDetailModal} />
                 ))}
               </div>
             )}
@@ -615,6 +827,7 @@ export default function App() {
       </div>
 
       <Lightbox image={lightboxImage} onClose={() => setLightboxImage(null)} />
+      <ItemModal item={detailModal} onClose={() => setDetailModal(null)} />
     </div>
   );
 }

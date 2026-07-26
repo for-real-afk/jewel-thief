@@ -2,11 +2,14 @@
 Multimodal Visual Jewellery Search Engine — FastAPI backend.
 
 Endpoints:
-  POST /api/v1/search               — upload a reference image, get ranked matches
-  POST /api/v1/catalog/index        — batch-upsert catalog items (images + items_json)
-  GET  /api/v1/catalog/jobs/{job_id} — indexing job progress/result
-  GET  /api/v1/catalog/items        — paginated list of indexed catalog items
-  GET  /health                      — healthcheck
+  POST   /api/v1/search                    — upload a reference image, get ranked matches
+  POST   /api/v1/catalog/index             — batch-upsert catalog items (images + items_json)
+  GET    /api/v1/catalog/jobs/{job_id}     — indexing job progress/result
+  GET    /api/v1/catalog/items             — paginated list of indexed catalog items
+  GET    /api/v1/catalog/items/{item_id}   — single catalog item
+  PATCH  /api/v1/catalog/items/{item_id}   — edit an item's metadata (and optionally its image)
+  DELETE /api/v1/catalog/items/{item_id}   — remove an item from the catalog
+  GET    /health                           — healthcheck
 """
 import json
 import logging
@@ -15,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -91,11 +94,10 @@ class IndexResponse(BaseModel):
     job_id: str
 
 
-class IndexItemMetadata(BaseModel):
-    """One catalog item's metadata, positionally aligned with the `images`
-    upload list. Only name/category/price are required — caption/description/
-    tags/material are free-form catalog copy an admin may not always fill in."""
-    item_id: str = Field(min_length=1)
+class CatalogItemFields(BaseModel):
+    """A catalog item's editable metadata. Only name/category/price are
+    required — caption/description/tags/material are free-form catalog copy
+    an admin may not always fill in."""
     name: str = Field(min_length=1)
     category: str = Field(min_length=1)
     price: float = Field(gt=0)
@@ -103,6 +105,12 @@ class IndexItemMetadata(BaseModel):
     description: str = ""
     tags: list[str] = Field(default_factory=list)
     material: Optional[str] = None
+
+
+class IndexItemMetadata(CatalogItemFields):
+    """One catalog item's metadata, positionally aligned with the `images`
+    upload list."""
+    item_id: str = Field(min_length=1)
 
 
 class FailedItem(BaseModel):
@@ -442,3 +450,97 @@ def list_catalog_items(limit: int = 20, offset: int = 0, x_api_key: Optional[str
     offset = max(0, offset)
     items, total = catalog_store.list_items(limit=limit, offset=offset)
     return CatalogItemsResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@app.get("/api/v1/catalog/items/{item_id}", response_model=dict)
+def get_catalog_item(item_id: str, x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+    item = catalog_store.get_item(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Unknown item_id.")
+    return item
+
+
+@app.patch("/api/v1/catalog/items/{item_id}", response_model=dict)
+async def update_catalog_item(
+    item_id: str,
+    fields: str = Form(...),
+    image: Optional[UploadFile] = File(None),
+    x_api_key: Optional[str] = Header(None),
+):
+    """
+    Edit an existing item's metadata, optionally replacing its image too.
+
+    fields is a JSON object matching CatalogItemFields (name/category/price
+    required). When no image is uploaded, only Supabase + Pinecone metadata
+    are updated in place — no re-embedding, since the vector is unchanged.
+    Uploading a new image re-embeds and overwrites the stored file, same as
+    a fresh index.
+    """
+    require_api_key(x_api_key)
+
+    existing = catalog_store.get_item(item_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Unknown item_id.")
+
+    try:
+        raw = json.loads(fields)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"fields is not valid JSON: {exc}")
+    try:
+        edited = CatalogItemFields(**raw)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "fields failed validation.", "errors": exc.errors()},
+        )
+
+    metadata = {
+        "filename": existing.get("filename"),
+        "name": edited.name,
+        "caption": edited.caption,
+        "description": edited.description,
+        "tags": edited.tags,
+        "category": edited.category,
+        "price": edited.price,
+        "image_url": existing.get("image_url"),
+    }
+    if edited.material:
+        metadata["material"] = edited.material
+
+    if image is not None:
+        raw_bytes = await image.read()
+        try:
+            clean_bytes = prepare_image_bytes(raw_bytes)
+        except InvalidImageError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        vector = embeddings.embed_catalog_image(clean_bytes)
+        image_path = CATALOG_IMAGE_DIR / f"{item_id}.jpg"
+        image_path.write_bytes(clean_bytes)
+        metadata["filename"] = image.filename
+        metadata["image_url"] = f"/static/catalog/{item_id}.jpg"
+        vector_db.upsert_batch([{"id": item_id, "vector": vector, "metadata": metadata}])
+    else:
+        vector_db.update_metadata(item_id, metadata)
+
+    catalog_store.record_item(item_id, metadata)
+    return {"item_id": item_id, **metadata}
+
+
+@app.delete("/api/v1/catalog/items/{item_id}", status_code=204)
+def delete_catalog_item(item_id: str, x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+
+    existing = catalog_store.get_item(item_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Unknown item_id.")
+
+    vector_db.delete_by_id(item_id)
+    catalog_store.delete_item(item_id)
+
+    image_path = CATALOG_IMAGE_DIR / f"{item_id}.jpg"
+    if image_path.exists():
+        image_path.unlink()
+
+    return Response(status_code=204)

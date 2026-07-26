@@ -31,3 +31,16 @@ def list_items(limit: int, offset: int) -> tuple[list[dict], int]:
     )
     items = [{"item_id": row["item_id"], **row["metadata"]} for row in result.data]
     return items, result.count or 0
+
+
+def get_item(item_id: str) -> dict | None:
+    """Single {item_id, **metadata} dict, or None if item_id isn't in the catalog."""
+    result = _client.table(_TABLE).select("item_id, metadata").eq("item_id", item_id).execute()
+    if not result.data:
+        return None
+    row = result.data[0]
+    return {"item_id": row["item_id"], **row["metadata"]}
+
+
+def delete_item(item_id: str) -> None:
+    _client.table(_TABLE).delete().eq("item_id", item_id).execute()
