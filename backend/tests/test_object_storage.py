@@ -2,7 +2,7 @@ import object_storage
 
 
 def test_upload_catalog_image_puts_object_and_returns_public_url(mocker):
-    mock_put = mocker.patch.object(object_storage._client, "put_object")
+    mock_put = mocker.patch.object(object_storage._get_client(), "put_object")
     mocker.patch.object(object_storage.settings, "r2_bucket_name", "test-bucket")
     mocker.patch.object(object_storage.settings, "r2_public_url_base", "https://pub-test.r2.dev")
 
@@ -15,7 +15,7 @@ def test_upload_catalog_image_puts_object_and_returns_public_url(mocker):
 
 
 def test_delete_catalog_image_calls_delete_object(mocker):
-    mock_delete = mocker.patch.object(object_storage._client, "delete_object")
+    mock_delete = mocker.patch.object(object_storage._get_client(), "delete_object")
     mocker.patch.object(object_storage.settings, "r2_bucket_name", "test-bucket")
 
     object_storage.delete_catalog_image("ring-1")
@@ -25,3 +25,14 @@ def test_delete_catalog_image_calls_delete_object(mocker):
 
 def test_key_for_uses_catalog_prefix_and_item_id():
     assert object_storage._key_for("abc-123") == "catalog/abc-123.jpg"
+
+
+def test_get_client_raises_clear_error_when_r2_account_id_unset(mocker):
+    mocker.patch.object(object_storage, "_client", None)
+    mocker.patch.object(object_storage.settings, "r2_account_id", "")
+
+    try:
+        object_storage._get_client()
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "R2_ACCOUNT_ID" in str(exc)
