@@ -47,20 +47,25 @@ class Settings(BaseModel):
 
     # -- Search behavior --
     top_k: int = int(os.getenv("TOP_K", "20"))
+    # Applies to IMAGE queries only. Text queries do NOT use an absolute
+    # cosine floor (see main.py's search()) -- per Google's own guidance
+    # against a fixed cutoff, and because cross-modal (text-vs-image) cosine
+    # scores run structurally lower than same-modality scores even for
+    # genuinely relevant matches (a real, measured production incident: every
+    # text query was returning no_match against a single shared threshold).
+    # Text-query filtering instead happens via
+    # reranker.score_candidates_cheap()'s blended score plus the conditional
+    # LLM-rerank gap check in main.py.
     min_similarity_threshold: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD", "0.55"))
-    # Text queries are compared cross-modal (text vector vs. image-derived
-    # catalog vectors) and measured lower in absolute cosine score than
-    # image-vs-image comparisons even for genuinely relevant matches -- real
-    # production data against the live catalog showed true positives around
-    # 0.40-0.47 with irrelevant categories starting to blend in only around
-    # ~0.40, nowhere near the 0.55 bar tuned for image queries. This cutoff
-    # only exists to avoid spending a reranker LLM call on true noise; the
-    # reranker's metadata-based judgment (reranker.py's _TEXT_PROMPT_TEMPLATE)
-    # is what actually filters wrong-category results, not this threshold.
-    min_similarity_threshold_text: float = float(os.getenv("MIN_SIMILARITY_THRESHOLD_TEXT", "0.35"))
 
     # -- API auth --
     api_key: str = os.getenv("APP_API_KEY", "change-me-in-production")
+
+    # -- Caching (see cache.py) --
+    # Empty string = use InMemoryCache (single-instance stopgap). Set once
+    # Redis is available in deployment -- cache.py's RedisCache (drop-in,
+    # same SearchCache interface) is the swap point; no other code changes.
+    redis_url: str = os.getenv("REDIS_URL", "")
 
     # -- CORS --
     allowed_origins: list[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")

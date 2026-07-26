@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
+import cache
 import catalog_store
 import embeddings
 import vector_db
@@ -82,6 +83,7 @@ class SearchResponse(BaseModel):
     matches: list[MatchResult]
     no_match: bool
     query_type: Literal["image", "text"]
+    reason: Optional[str] = None
 
 
 class IndexResponse(BaseModel):
@@ -151,6 +153,122 @@ def health():
     return {"status": "ok"}
 
 
+def build_catalog_text_description(name: str, caption: str, description: str, tags: list[str]) -> str:
+    """The text half of a fused catalog embedding (see
+    embeddings.embed_catalog_item). Single source of truth for this string's
+    shape -- also imported by scripts/reembed_catalog.py so a full-catalog
+    re-embed produces text in exactly the same form new items get indexed
+    with, not a subtly different one."""
+    return f"name: {name}. {caption}. {description}. Tags: {', '.join(tags)}."
+
+
+# Text-query cheap-scoring gap (reranker.score_candidates_cheap's
+# blended_score, top result vs. 3rd place or the last available) below which
+# results are treated as genuinely ambiguous and escalated to a real LLM
+# judgment via reranker.rerank(). See main.py's search() and reranker.py's
+# module docstring for the full conditional-rerank flow.
+_TEXT_RERANK_GAP_THRESHOLD = 0.1
+
+
+def _not_jewelry_response(query_id: str) -> SearchResponse:
+    return SearchResponse(
+        query_id=query_id,
+        matches=[],
+        no_match=True,
+        query_type="image",
+        reason="The uploaded photo doesn't appear to show a piece of jewellery.",
+    )
+
+
+def _matches_from_ranked(ranked: list[dict]) -> list[MatchResult]:
+    return [
+        MatchResult(
+            id=m["id"],
+            similarity_percent=round(m["score"] * 100, 1),
+            confidence=m["confidence"],
+            reason=m["reason"],
+            metadata=m["metadata"],
+        )
+        for m in ranked
+    ]
+
+
+async def _search_image(image: UploadFile, metadata_filter: dict) -> SearchResponse:
+    """Image-query path: unchanged from before this consolidation pass except
+    for the domain gate below -- score >= min_similarity_threshold filter,
+    then always reranker.rerank() (no cheap-scoring equivalent exists for
+    judging visual traits against a photo)."""
+    query_id = str(uuid.uuid4())
+    raw_bytes = await image.read()
+    try:
+        clean_bytes = prepare_image_bytes(raw_bytes)
+    except InvalidImageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # Domain gate BEFORE the expensive embed -> search -> rerank pipeline --
+    # both a correctness fix (an unrelated photo can still clear the cosine
+    # threshold against SOME catalog item in a shared embedding space) and a
+    # cost optimization (rejects obviously irrelevant uploads before spending
+    # an embedding call, a Pinecone query, and a potential rerank call).
+    if not reranker.is_plausibly_jewelry(clean_bytes):
+        return _not_jewelry_response(query_id)
+
+    query_vector = embeddings.embed_image(clean_bytes)
+    raw_matches = vector_db.search(query_vector, metadata_filter=metadata_filter or None)
+
+    strong_matches = [m for m in raw_matches if m["score"] >= settings.min_similarity_threshold]
+    if not strong_matches:
+        return SearchResponse(query_id=query_id, matches=[], no_match=True, query_type="image")
+
+    ranked = reranker.rerank({"type": "image", "bytes": clean_bytes}, strong_matches)
+    return SearchResponse(
+        query_id=query_id, no_match=False, query_type="image", matches=_matches_from_ranked(ranked)
+    )
+
+
+def _search_text(text: str, metadata_filter: dict) -> SearchResponse:
+    """Text-query path: no absolute cosine floor (Google's own guidance
+    against a fixed cutoff for this model, and cross-modal scores run
+    structurally lower than image-vs-image scores -- see config.py). Default
+    ranking is score_candidates_cheap() (zero API calls); reranker.rerank()
+    only fires when the cheap-scored top results are genuinely ambiguous."""
+    query_id = str(uuid.uuid4())
+
+    key = cache.cache_key(text, metadata_filter)
+    query_vector = cache._cache.get(key)
+    if query_vector is None:
+        query_vector = embeddings.embed_text_query(text)
+        cache._cache.set(key, query_vector)
+
+    raw_matches = vector_db.search(query_vector, metadata_filter=metadata_filter or None)
+
+    # no_match now only fires for an empty result set outright (empty
+    # catalog, or a metadata filter matching nothing) -- NOT for low scores,
+    # which is the exact bug that silently zeroed out every text search
+    # before this fix (see README.md §11).
+    if not raw_matches:
+        return SearchResponse(query_id=query_id, matches=[], no_match=True, query_type="text")
+
+    candidates = raw_matches[:settings.top_k]
+    cheap_scored = reranker.score_candidates_cheap(text, candidates)
+
+    if len(cheap_scored) >= 3:
+        gap = cheap_scored[0]["blended_score"] - cheap_scored[2]["blended_score"]
+    else:
+        gap = cheap_scored[0]["blended_score"] - cheap_scored[-1]["blended_score"]
+
+    if gap >= _TEXT_RERANK_GAP_THRESHOLD:
+        logger.info("text search: cheap path used (gap=%.3f)", gap)
+        ranked = cheap_scored
+    else:
+        logger.info("text search: LLM rerank triggered, gap=%.3f", gap)
+        ranked = reranker.rerank({"type": "text", "text": text}, candidates)
+
+    return SearchResponse(
+        query_id=query_id, no_match=False, query_type="text", matches=_matches_from_ranked(ranked)
+    )
+
+
 @app.post("/api/v1/search", response_model=SearchResponse, dependencies=[])
 async def search(
     image: Optional[UploadFile] = File(None),
@@ -161,14 +279,12 @@ async def search(
     x_api_key: Optional[str] = Header(None),
 ):
     """
-    Accepts EITHER an image OR a text query, never both — the two paths
-    share the same Pinecone index and the same embedding model
-    (gemini-embedding-2 is natively multimodal: text and images already
-    live in one comparable vector space, so a text query just needs
-    task_type="RETRIEVAL_QUERY" like an image query does, not a separate
-    pipeline). Everything downstream of embedding — metadata filtering,
-    vector_db.search, the similarity threshold, reranking — is identical
-    regardless of which input type was used.
+    Accepts EITHER an image OR a text query, never both -- the two paths
+    share the same Pinecone index and the same embedding model, but diverge
+    sharply downstream: image queries always use an absolute cosine floor
+    plus a mandatory LLM rerank; text queries use rank-based cheap scoring by
+    default and only escalate to an LLM rerank when results are ambiguous
+    (see _search_image / _search_text).
     """
     require_api_key(x_api_key)
 
@@ -181,20 +297,6 @@ async def search(
     if has_image and has_text:
         raise HTTPException(status_code=400, detail="Provide only one of image or text query, not both.")
 
-    if has_image:
-        raw_bytes = await image.read()
-        try:
-            clean_bytes = prepare_image_bytes(raw_bytes)
-        except InvalidImageError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        query_vector = embeddings.embed_query_image(clean_bytes)
-        query_type: Literal["image", "text"] = "image"
-        rerank_query = {"type": "image", "bytes": clean_bytes}
-    else:
-        query_vector = embeddings.embed_text_query(text)
-        query_type = "text"
-        rerank_query = {"type": "text", "text": text}
-
     metadata_filter: dict = {}
     if category:
         metadata_filter["category"] = {"$eq": category}
@@ -206,37 +308,9 @@ async def search(
             price_filter["$lte"] = max_price
         metadata_filter["price"] = price_filter
 
-    raw_matches = vector_db.search(query_vector, metadata_filter=metadata_filter or None)
-
-    # Apply similarity threshold before spending a reranker call on weak
-    # candidates. Text queries use a lower bar than image queries -- see
-    # config.py's min_similarity_threshold_text comment for why cross-modal
-    # cosine scores run systematically lower even for true matches.
-    threshold = (
-        settings.min_similarity_threshold_text if query_type == "text" else settings.min_similarity_threshold
-    )
-    strong_matches = [m for m in raw_matches if m["score"] >= threshold]
-
-    if not strong_matches:
-        return SearchResponse(query_id=str(uuid.uuid4()), matches=[], no_match=True, query_type=query_type)
-
-    ranked = reranker.rerank(rerank_query, strong_matches)
-
-    return SearchResponse(
-        query_id=str(uuid.uuid4()),
-        no_match=False,
-        query_type=query_type,
-        matches=[
-            MatchResult(
-                id=m["id"],
-                similarity_percent=round(m["score"] * 100, 1),
-                confidence=m["confidence"],
-                reason=m["reason"],
-                metadata=m["metadata"],
-            )
-            for m in ranked
-        ],
-    )
+    if has_image:
+        return await _search_image(image, metadata_filter)
+    return _search_text(text, metadata_filter)
 
 
 # job_id -> {"status", "total", "processed", "failed_items"}. In-memory and
@@ -261,7 +335,10 @@ async def _index_job(job_id: str, items_payload: list[dict]):
         meta: IndexItemMetadata = item["meta"]
         try:
             clean_bytes = prepare_image_bytes(item["raw_bytes"])
-            vector = embeddings.embed_catalog_image(clean_bytes)
+            text_description = build_catalog_text_description(
+                meta.name, meta.caption, meta.description, meta.tags
+            )
+            vector = embeddings.embed_catalog_item(clean_bytes, text_description)
 
             image_path = CATALOG_IMAGE_DIR / f"{meta.item_id}.jpg"
             image_path.write_bytes(clean_bytes)

@@ -3,11 +3,20 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+import cache
 import main
 
 client = TestClient(main.app)
 
 VALID_KEY = main.settings.api_key
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cache(mocker):
+    """Every test gets an isolated cache -- otherwise a cached vector from one
+    test's fake data could leak into another test via the module-level
+    singleton and skip embed_text_query when the test expects it to run."""
+    mocker.patch.object(cache, "_cache", cache.InMemoryCache())
 
 
 def _image_file(jpeg_bytes, filename="query.jpg"):
@@ -20,6 +29,10 @@ def _fake_match(id_, score, category="ring"):
 
 def _fake_ranked(match, confidence="high", reason="matching cut"):
     return {**match, "confidence": confidence, "reason": reason}
+
+
+def _pass_jewelry_gate(mocker):
+    return mocker.patch.object(main.reranker, "is_plausibly_jewelry", return_value=True)
 
 
 @pytest.mark.parametrize("caption,expected", [
@@ -61,8 +74,11 @@ def test_search_with_corrupt_image_returns_400(corrupt_image_bytes):
     assert "detail" in resp.json()
 
 
+# --- Image queries ---
+
 def test_search_happy_path(mocker, valid_jpeg_bytes):
-    mocker.patch.object(main.embeddings, "embed_query_image", return_value=[0.1] * 8)
+    _pass_jewelry_gate(mocker)
+    mocker.patch.object(main.embeddings, "embed_image", return_value=[0.1] * 8)
     raw_matches = [_fake_match("a", 0.91), _fake_match("b", 0.80), _fake_match("c", 0.61)]
     mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
     mocker.patch.object(main.reranker, "rerank", return_value=[_fake_ranked(m) for m in raw_matches])
@@ -80,7 +96,8 @@ def test_search_happy_path(mocker, valid_jpeg_bytes):
 
 
 def test_search_all_below_threshold_returns_no_match_without_reranking(mocker, valid_jpeg_bytes):
-    mocker.patch.object(main.embeddings, "embed_query_image", return_value=[0.1] * 8)
+    _pass_jewelry_gate(mocker)
+    mocker.patch.object(main.embeddings, "embed_image", return_value=[0.1] * 8)
     weak_matches = [_fake_match("a", 0.10), _fake_match("b", 0.05)]
     mocker.patch.object(main.vector_db, "search", return_value=weak_matches)
     mock_rerank = mocker.patch.object(main.reranker, "rerank")
@@ -97,7 +114,8 @@ def test_search_all_below_threshold_returns_no_match_without_reranking(mocker, v
 
 
 def test_search_builds_correct_metadata_filter_from_category_and_price(mocker, valid_jpeg_bytes):
-    mocker.patch.object(main.embeddings, "embed_query_image", return_value=[0.1] * 8)
+    _pass_jewelry_gate(mocker)
+    mocker.patch.object(main.embeddings, "embed_image", return_value=[0.1] * 8)
     mock_search = mocker.patch.object(main.vector_db, "search", return_value=[])
 
     resp = client.post(
@@ -116,7 +134,8 @@ def test_search_builds_correct_metadata_filter_from_category_and_price(mocker, v
 
 
 def test_search_image_response_has_query_type_image(mocker, valid_jpeg_bytes):
-    mocker.patch.object(main.embeddings, "embed_query_image", return_value=[0.1] * 8)
+    _pass_jewelry_gate(mocker)
+    mocker.patch.object(main.embeddings, "embed_image", return_value=[0.1] * 8)
     raw_matches = [_fake_match("a", 0.91)]
     mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
     mock_rerank = mocker.patch.object(main.reranker, "rerank", return_value=[_fake_ranked(m) for m in raw_matches])
@@ -131,13 +150,166 @@ def test_search_image_response_has_query_type_image(mocker, valid_jpeg_bytes):
     assert query_arg == {"type": "image", "bytes": mocker.ANY}
 
 
+# --- Domain gate (Step 12) ---
+
+def test_search_image_rejected_by_domain_gate_never_embeds_or_searches(mocker, valid_jpeg_bytes):
+    mocker.patch.object(main.reranker, "is_plausibly_jewelry", return_value=False)
+    mock_embed = mocker.patch.object(main.embeddings, "embed_image")
+    mock_search = mocker.patch.object(main.vector_db, "search")
+
+    resp = client.post(
+        "/api/v1/search", files=_image_file(valid_jpeg_bytes), headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["no_match"] is True
+    assert body["matches"] == []
+    assert body["query_type"] == "image"
+    assert body["reason"] == "The uploaded photo doesn't appear to show a piece of jewellery."
+    mock_embed.assert_not_called()
+    mock_search.assert_not_called()
+
+
+def test_search_image_accepted_by_domain_gate_proceeds_normally(mocker, valid_jpeg_bytes):
+    mocker.patch.object(main.reranker, "is_plausibly_jewelry", return_value=True)
+    mocker.patch.object(main.embeddings, "embed_image", return_value=[0.1] * 8)
+    raw_matches = [_fake_match("a", 0.91)]
+    mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
+    mocker.patch.object(main.reranker, "rerank", return_value=[_fake_ranked(m) for m in raw_matches])
+
+    resp = client.post(
+        "/api/v1/search", files=_image_file(valid_jpeg_bytes), headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["no_match"] is False
+
+
+# --- Text queries: default cheap path vs. conditional LLM rerank (Step 6) ---
+
+def test_search_text_query_well_separated_never_calls_llm_rerank(mocker):
+    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    raw_matches = [_fake_match("a", 0.9), _fake_match("b", 0.8), _fake_match("c", 0.7)]
+    mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
+    cheap_scored = [
+        {**raw_matches[0], "confidence": "high", "reason": "x", "blended_score": 0.90},
+        {**raw_matches[1], "confidence": "medium", "reason": "x", "blended_score": 0.50},
+        {**raw_matches[2], "confidence": "low", "reason": "x", "blended_score": 0.40},
+    ]
+    mocker.patch.object(main.reranker, "score_candidates_cheap", return_value=cheap_scored)
+    mock_rerank = mocker.patch.object(main.reranker, "rerank")
+
+    resp = client.post(
+        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["no_match"] is False
+    assert [m["id"] for m in body["matches"]] == ["a", "b", "c"]
+    mock_rerank.assert_not_called()
+
+
+def test_search_text_query_ambiguous_top_results_triggers_llm_rerank(mocker):
+    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    raw_matches = [_fake_match("a", 0.9), _fake_match("b", 0.85), _fake_match("c", 0.83)]
+    mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
+    # gap between 1st and 3rd place blended_score is 0.90 - 0.86 = 0.04 < 0.1
+    cheap_scored = [
+        {**raw_matches[0], "confidence": "medium", "reason": "x", "blended_score": 0.90},
+        {**raw_matches[1], "confidence": "medium", "reason": "x", "blended_score": 0.88},
+        {**raw_matches[2], "confidence": "medium", "reason": "x", "blended_score": 0.86},
+    ]
+    mocker.patch.object(main.reranker, "score_candidates_cheap", return_value=cheap_scored)
+    llm_ranked = [_fake_ranked(m) for m in raw_matches]
+    mock_rerank = mocker.patch.object(main.reranker, "rerank", return_value=llm_ranked)
+
+    resp = client.post(
+        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["no_match"] is False
+    mock_rerank.assert_called_once()
+    query_arg = mock_rerank.call_args.args[0]
+    assert query_arg == {"type": "text", "text": "gold ring"}
+    assert [m["id"] for m in body["matches"]] == ["a", "b", "c"]
+
+
+def test_search_text_query_fewer_than_3_candidates_uses_first_vs_last_gap(mocker):
+    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    raw_matches = [_fake_match("a", 0.9), _fake_match("b", 0.5)]
+    mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
+    # Only 2 candidates -> gap is 1st vs last (not 3rd, which doesn't exist).
+    # 0.90 - 0.40 = 0.50 >= 0.1 -> cheap path.
+    cheap_scored = [
+        {**raw_matches[0], "confidence": "high", "reason": "x", "blended_score": 0.90},
+        {**raw_matches[1], "confidence": "low", "reason": "x", "blended_score": 0.40},
+    ]
+    mocker.patch.object(main.reranker, "score_candidates_cheap", return_value=cheap_scored)
+    mock_rerank = mocker.patch.object(main.reranker, "rerank")
+
+    resp = client.post(
+        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    mock_rerank.assert_not_called()
+
+
+def test_search_text_query_empty_raw_matches_returns_no_match(mocker):
+    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    mocker.patch.object(main.vector_db, "search", return_value=[])
+    mock_cheap = mocker.patch.object(main.reranker, "score_candidates_cheap")
+    mock_rerank = mocker.patch.object(main.reranker, "rerank")
+
+    resp = client.post(
+        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["no_match"] is True
+    assert body["query_type"] == "text"
+    mock_cheap.assert_not_called()
+    mock_rerank.assert_not_called()
+
+
+def test_search_text_query_low_scores_but_nonempty_does_not_trigger_no_match(mocker):
+    """The old threshold-based no_match must NOT fire for text queries
+    anymore -- see main.py's _search_text and README.md §11."""
+    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    low_matches = [_fake_match("a", 0.05), _fake_match("b", 0.03)]
+    mocker.patch.object(main.vector_db, "search", return_value=low_matches)
+    # Gap deliberately >= 0.1 so this test stays on the cheap path -- the
+    # ambiguous/LLM-rerank branch is covered separately above.
+    cheap_scored = [
+        {**low_matches[0], "confidence": "low", "reason": "x", "blended_score": 0.30},
+        {**low_matches[1], "confidence": "low", "reason": "x", "blended_score": 0.05},
+    ]
+    mocker.patch.object(main.reranker, "score_candidates_cheap", return_value=cheap_scored)
+
+    resp = client.post(
+        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["no_match"] is False
+    assert len(body["matches"]) == 2
+
+
 def test_search_text_query_happy_path(mocker):
     mock_embed = mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
     raw_matches = [_fake_match("a", 0.91), _fake_match("b", 0.80)]
     mocker.patch.object(main.vector_db, "search", return_value=raw_matches)
-    mock_rerank = mocker.patch.object(
-        main.reranker, "rerank", return_value=[_fake_ranked(m) for m in raw_matches]
-    )
+    cheap_scored = [
+        {**raw_matches[0], "confidence": "high", "reason": "x", "blended_score": 0.9},
+        {**raw_matches[1], "confidence": "low", "reason": "x", "blended_score": 0.3},
+    ]
+    mocker.patch.object(main.reranker, "score_candidates_cheap", return_value=cheap_scored)
 
     resp = client.post(
         "/api/v1/search",
@@ -151,27 +323,6 @@ def test_search_text_query_happy_path(mocker):
     assert body["no_match"] is False
     assert len(body["matches"]) == 2
     mock_embed.assert_called_once_with("gold pink enamel earrings")
-    query_arg = mock_rerank.call_args.args[0]
-    assert query_arg == {"type": "text", "text": "gold pink enamel earrings"}
-
-
-def test_search_text_query_all_below_threshold_returns_no_match(mocker):
-    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
-    weak_matches = [_fake_match("a", 0.05)]
-    mocker.patch.object(main.vector_db, "search", return_value=weak_matches)
-    mock_rerank = mocker.patch.object(main.reranker, "rerank")
-
-    resp = client.post(
-        "/api/v1/search",
-        data={"query_text": "gold ring"},
-        headers={"x-api-key": VALID_KEY},
-    )
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["no_match"] is True
-    assert body["query_type"] == "text"
-    mock_rerank.assert_not_called()
 
 
 def test_search_with_both_image_and_query_text_returns_400(valid_jpeg_bytes):
@@ -207,42 +358,29 @@ def test_search_text_query_requires_api_key():
     assert resp.status_code == 401
 
 
-def test_search_text_query_uses_lower_threshold_than_image_query(mocker):
-    # 0.45 clears MIN_SIMILARITY_THRESHOLD_TEXT (0.35) but not
-    # MIN_SIMILARITY_THRESHOLD (0.55) -- real production cross-modal text
-    # queries against the live catalog scored true positives in exactly
-    # this 0.40-0.47 range, well under the image-tuned 0.55 bar.
-    mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
-    borderline_matches = [_fake_match("a", 0.45)]
-    mocker.patch.object(main.vector_db, "search", return_value=borderline_matches)
-    mocker.patch.object(main.reranker, "rerank", return_value=[_fake_ranked(m) for m in borderline_matches])
+# --- Caching (Step 7) ---
 
-    resp = client.post(
-        "/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY}
-    )
+def test_search_text_query_second_identical_search_skips_embedding(mocker):
+    mock_embed = mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    mocker.patch.object(main.vector_db, "search", return_value=[])
 
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["no_match"] is False
-    assert len(body["matches"]) == 1
+    client.post("/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY})
+    client.post("/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY})
+
+    mock_embed.assert_called_once()
 
 
-def test_search_image_query_still_rejects_score_that_would_pass_text_threshold(mocker, valid_jpeg_bytes):
-    # Same 0.45 score -- must still be rejected on the image path, proving
-    # the lower bar is applied only to query_type="text", not globally.
-    mocker.patch.object(main.embeddings, "embed_query_image", return_value=[0.1] * 8)
-    borderline_matches = [_fake_match("a", 0.45)]
-    mocker.patch.object(main.vector_db, "search", return_value=borderline_matches)
-    mock_rerank = mocker.patch.object(main.reranker, "rerank")
+def test_search_text_query_different_text_does_not_hit_cache(mocker):
+    mock_embed = mocker.patch.object(main.embeddings, "embed_text_query", return_value=[0.1] * 8)
+    mocker.patch.object(main.vector_db, "search", return_value=[])
 
-    resp = client.post(
-        "/api/v1/search", files=_image_file(valid_jpeg_bytes), headers={"x-api-key": VALID_KEY}
-    )
+    client.post("/api/v1/search", data={"query_text": "gold ring"}, headers={"x-api-key": VALID_KEY})
+    client.post("/api/v1/search", data={"query_text": "silver necklace"}, headers={"x-api-key": VALID_KEY})
 
-    assert resp.status_code == 200
-    assert resp.json()["no_match"] is True
-    mock_rerank.assert_not_called()
+    assert mock_embed.call_count == 2
 
+
+# --- Catalog indexing (fused embed_catalog_item) ---
 
 def _item(item_id, name="Item", category="ring", price=100.0, **extra):
     return {"item_id": item_id, "name": name, "category": category, "price": price, **extra}
@@ -305,7 +443,7 @@ def test_catalog_index_price_must_be_positive(valid_jpeg_bytes):
 
 def test_catalog_index_happy_path_stores_full_metadata(mocker, valid_jpeg_bytes, tmp_path):
     mocker.patch.object(main, "CATALOG_IMAGE_DIR", tmp_path)
-    mocker.patch.object(main.embeddings, "embed_catalog_image", return_value=[0.1] * 8)
+    mock_embed = mocker.patch.object(main.embeddings, "embed_catalog_item", return_value=[0.1] * 8)
     mock_upsert = mocker.patch.object(main.vector_db, "upsert_batch", return_value=1)
     mock_record = mocker.patch.object(main.catalog_store, "record_item")
 
@@ -350,6 +488,10 @@ def test_catalog_index_happy_path_stores_full_metadata(mocker, valid_jpeg_bytes,
     mock_record.assert_any_call("ring-1", first_call_items[0]["metadata"])
     assert (tmp_path / "ring-1.jpg").exists()
 
+    # embed_catalog_item gets the fused text description built from metadata
+    first_call_text = mock_embed.call_args_list[0].args[1]
+    assert first_call_text == "name: Solitaire Ring. a gold ring. A hand-forged solitaire.. Tags: gold, solitaire."
+
     # second item had no material/caption/description/tags supplied -> defaults, no material key
     second_call_items = mock_upsert.call_args_list[1].args[0]
     assert second_call_items[0]["metadata"]["caption"] == ""
@@ -360,7 +502,7 @@ def test_catalog_index_happy_path_stores_full_metadata(mocker, valid_jpeg_bytes,
 def test_catalog_index_per_item_failure_does_not_abort_batch(mocker, valid_jpeg_bytes, tmp_path):
     mocker.patch.object(main, "CATALOG_IMAGE_DIR", tmp_path)
     mocker.patch.object(
-        main.embeddings, "embed_catalog_image",
+        main.embeddings, "embed_catalog_item",
         side_effect=[[0.1] * 8, Exception("embedding API down"), [0.2] * 8],
     )
     mocker.patch.object(main.vector_db, "upsert_batch", return_value=1)
@@ -390,7 +532,7 @@ def test_catalog_index_per_item_failure_does_not_abort_batch(mocker, valid_jpeg_
 
 def test_catalog_index_all_items_failing_marks_job_failed(mocker, valid_jpeg_bytes, tmp_path):
     mocker.patch.object(main, "CATALOG_IMAGE_DIR", tmp_path)
-    mocker.patch.object(main.embeddings, "embed_catalog_image", side_effect=Exception("down"))
+    mocker.patch.object(main.embeddings, "embed_catalog_item", side_effect=Exception("down"))
 
     resp = client.post(
         "/api/v1/catalog/index",

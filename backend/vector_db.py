@@ -54,7 +54,11 @@ def search(
         include_metadata=True,
         filter=metadata_filter or {},
     )
+    # Pinecone's approximate cosine computation can overshoot slightly past
+    # [0, 1] (e.g. 1.004) due to floating-point error in the ANN index -- this
+    # is the one place every result flows through, so the clamp guarantee
+    # belongs here rather than scattered across every caller.
     return [
-        {"id": m["id"], "score": m["score"], "metadata": m.get("metadata", {})}
+        {"id": m["id"], "score": max(0.0, min(m["score"], 1.0)), "metadata": m.get("metadata", {})}
         for m in result["matches"]
     ]

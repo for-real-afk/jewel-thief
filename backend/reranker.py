@@ -23,12 +23,24 @@ description (see main.py's /api/v1/search):
   - {"type": "image", "bytes": <jpeg bytes>} — the original path. The
     reference photo is sent as a multimodal Part alongside the prompt, and
     the LLM judges visual traits (gemstone cut, metal color/finish, band
-    pattern, silhouette) it can actually see.
-  - {"type": "text", "text": <query string>} — no image exists to send.
-    The LLM instead judges each candidate's METADATA (name/category/
-    material/caption/description/tags) against the stated query terms
-    (material, color, style words) — it is explicitly told not to invent
-    visual details it has no way to observe from text alone.
+    pattern, silhouette) it can actually see. ALWAYS goes through this LLM
+    rerank() path — there's no cheap-scoring equivalent for judging visual
+    traits against a photo.
+  - {"type": "text", "text": <query string>} — no image exists to send. This
+    is now the LLM rerank() path's fallback only: the default text-query path
+    is score_candidates_cheap() (zero API calls), and rerank() is called on
+    text candidates only when main.py finds the cheap-scored results are
+    ambiguous (see main.py's conditional-rerank logic). When it IS called for
+    a text query, the LLM instead judges each candidate's METADATA
+    (name/category/material/caption/description/tags) against the stated
+    query terms (material, color, style words) — it is explicitly told not to
+    invent visual details it has no way to observe from text alone.
+
+Sorting: every code path that produces a final ranked list (rerank() and
+score_candidates_cheap()) sorts by the SAME final_rank_score() function below,
+not two independently-maintained sort implementations. Confidence is a
+bounded tiebreaker, not a primary sort key — see final_rank_score's docstring
+for why.
 """
 import json
 import re
@@ -77,6 +89,12 @@ Candidates:
 {candidate_list}
 """
 
+_JEWELLERY_GATE_PROMPT = (
+    "Does this image show a piece of jewellery (ring, earring, necklace, "
+    "bracelet, pendant, brooch, etc.) as the main subject? "
+    "Answer with exactly one word: yes or no."
+)
+
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
@@ -92,12 +110,27 @@ def _strip_reasoning(raw_text: str) -> str:
 # error (see utils.py's _CHAT_MAX_TOKENS comment). Text queries: there is no
 # image, so caption/description/tags are the primary signal, not filler —
 # they're the only place material/color terms the customer searched for
-# would actually appear. (Removing the image itself more than offsets this
-# for total token budget — see the "hasn't been measured" caveat in
-# embeddings.py/README.md though: real prompt sizes for rich catalog copy
-# aren't verified against Groq's limit the way the image path now is.)
+# would actually appear.
 _IMAGE_METADATA_FIELDS = ("name", "category", "material")
 _TEXT_METADATA_FIELDS = ("name", "category", "material", "caption", "description", "tags")
+
+# Confidence is a BOUNDED tiebreaker, never a primary sort key. Sorting by
+# (confidence_rank, -score) directly -- the previous scheme -- let a "medium"
+# candidate with a much higher cosine score sink below several "high"
+# candidates with lower scores (observed for real: a high-scoring result
+# landing 6th). A flat additive weight instead means confidence can only ever
+# nudge a close call, never override a large score gap: a 0.75 "medium"
+# (0.75 + 0.0 = 0.75) still outranks a 0.55 "high" (0.55 + 0.05 = 0.60)... but
+# a 0.60 "high" (0.65) does edge out a 0.58 "medium" (0.58) when scores are
+# genuinely close. Cosine score is the real retrieval signal and should
+# dominate; confidence is the LLM's read on it and should only refine.
+CONFIDENCE_WEIGHT = {"high": 0.05, "medium": 0.0, "low": -0.05}
+
+
+def final_rank_score(candidate: dict) -> float:
+    """The one sort key used by every code path that produces a final ranked
+    list (rerank() and score_candidates_cheap()) -- see module docstring."""
+    return candidate["score"] + CONFIDENCE_WEIGHT.get(candidate.get("confidence"), 0.0)
 
 
 def _summarize_for_prompt(metadata: dict, fields: tuple) -> str:
@@ -133,7 +166,8 @@ def rerank(query: dict, candidates: list[dict]) -> list[dict]:
     query: {"type": "image", "bytes": <jpeg bytes>} or {"type": "text", "text": <str>}
     candidates: [{"id": str, "score": float, "metadata": dict}, ...] from vector_db.search
     Returns candidates enriched with "confidence" and "reason", sorted by
-    (confidence tier, cosine score) — cosine score remains the primary ranking signal.
+    final_rank_score() -- cosine score remains the dominant ranking signal,
+    confidence only a bounded tiebreaker (see final_rank_score docstring).
     """
     if not candidates:
         return []
@@ -164,7 +198,6 @@ def rerank(query: dict, candidates: list[dict]) -> list[dict]:
         # rather than failing the whole search.
         judgments = {}
 
-    confidence_rank = {"high": 0, "medium": 1, "low": 2}
     enriched = []
     for c in candidates:
         judgment = judgments.get(c["id"], {"confidence": "medium", "reason": "no reranker judgment available"})
@@ -174,5 +207,58 @@ def rerank(query: dict, candidates: list[dict]) -> list[dict]:
             "reason": judgment["reason"],
         })
 
-    enriched.sort(key=lambda c: (confidence_rank.get(c["confidence"], 1), -c["score"]))
+    enriched.sort(key=lambda c: -final_rank_score(c))
     return enriched
+
+
+def score_candidates_cheap(query_text: str, candidates: list[dict]) -> list[dict]:
+    """Blend cosine similarity with lexical overlap against stored metadata
+    text. Zero external calls — this is the DEFAULT ranking path for text
+    queries (see main.py: the LLM rerank() path only fires when this cheap
+    score leaves the top results ambiguous)."""
+    if not candidates:
+        return []
+
+    query_terms = set(query_text.lower().split())
+    scored = []
+    for c in candidates:
+        meta_text = " ".join(str(v) for v in c["metadata"].values()).lower()
+        overlap = sum(1 for t in query_terms if t in meta_text) / max(len(query_terms), 1)
+        blended = 0.7 * c["score"] + 0.3 * overlap
+        confidence = "high" if blended > 0.75 else "medium" if blended > 0.5 else "low"
+        scored.append({
+            **c,
+            "confidence": confidence,
+            "reason": "matched on similarity and description overlap",
+            "blended_score": blended,
+        })
+    return sorted(scored, key=lambda c: -final_rank_score(c))
+
+
+@external_api_retry
+def is_plausibly_jewelry(image_bytes: bytes) -> bool:
+    """Cheap one-word classification gate, run BEFORE the expensive
+    embed -> search -> rerank pipeline for image queries. Reuses the existing
+    fast reranker model, no new provider. This is NOT the same as rerank()'s
+    judgment call: it runs earlier, on a single image, before any candidates
+    even exist, and only answers "is this worth searching for at all" — it
+    doubles as a cost optimization (rejects an obviously irrelevant upload
+    before spending an embedding call + Pinecone query + potential rerank
+    call on it).
+
+    Heuristic, not a guarantee: a single fast classification call can produce
+    both false negatives (real jewelry rejected, e.g. an unusually abstract
+    or sculptural piece) and false positives (an ambiguous non-jewelry photo
+    passing through) — see README.md §13. Does not apply to text queries:
+    there's no image to classify, and a vague text query isn't the same
+    failure mode as an entirely unrelated photo.
+    """
+    response = _client.models.generate_content(
+        model=settings.reranker_model,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+            _JEWELLERY_GATE_PROMPT,
+        ],
+        config=types.GenerateContentConfig(max_output_tokens=5),
+    )
+    return response.text.strip().lower().startswith("y")

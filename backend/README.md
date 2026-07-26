@@ -116,17 +116,27 @@ BackgroundTask (_index_job) so a bulk upload doesn't time out the request
   │
   ▼
 For EACH item independently (one bad image doesn't abort the rest):
-  1. preprocessing.prepare_image_bytes()  — normalize (§4)
-  2. embeddings.embed_catalog_image()     — normalized bytes -> 768-dim vector
-  3. write normalized JPEG to static/catalog/{item_id}.jpg
-  4. vector_db.upsert_batch([{id, vector, metadata}])  — write to Pinecone
-  5. catalog_store.record_item(item_id, metadata)      — mirror to local JSON
-  6. update _jobs[job_id] progress (processed count, or failed_items entry)
+  1. preprocessing.prepare_image_bytes()      — normalize (§4)
+  2. main.build_catalog_text_description()    — "name: {name}. {caption}.
+                                                 {description}. Tags: {tags}."
+  3. embeddings.embed_catalog_item(bytes, text) — ONE fused vector: image
+                                                 bytes + text description sent
+                                                 in a single interleaved call
+                                                 (§4.1) -- not two vectors, not
+                                                 an average of two calls
+  4. write normalized JPEG to static/catalog/{item_id}.jpg
+  5. vector_db.upsert_batch([{id, vector, metadata}])  — write to Pinecone
+  6. catalog_store.record_item(item_id, metadata)      — mirror to Supabase (§7)
+  7. update _jobs[job_id] progress (processed count, or failed_items entry)
   │
   ▼
 Admin polls GET /api/v1/catalog/jobs/{job_id} every 2s until status is
 "done" (partial failures still count as done) or "failed" (every item failed)
 ```
+
+`scripts/reembed_catalog.py` re-runs steps 1-3+5 above against every already-indexed
+item (metadata from Supabase, image from `static/catalog/`) — see the scripts table in
+§9 for when this is needed and why it's destructive.
 
 ### 3.2 Search (querying with a photo or a text description)
 
@@ -137,56 +147,80 @@ via a `query_type: "image" | "text"` field echoed back on `SearchResponse`, but 
 paths converge on the same Pinecone index and the same 768-dim vector space** — see §4.2
 for why that's possible without a second embedding pipeline.
 
+The two paths diverge sharply past embedding — image queries always use an absolute
+cosine floor plus a mandatory LLM rerank; text queries use free-ranking cheap scoring
+by default and only escalate to an LLM when results are genuinely ambiguous:
+
 ```text
-                    image                                    query_text
-                      │                                           │
-                      ▼                                           ▼
-  preprocessing.prepare_image_bytes()          text = query_text.strip()  (blank
-    — same normalization as indexing;            after stripping is treated as
-    query and catalog images MUST go             "not provided" → 400, same as
-    through the identical pipeline, or            omitting the field entirely)
-    systematic differences (crop, scale)                          │
-    would bias similarity scores                                  │
-                      │                                            │
-                      ▼                                            ▼
-  embeddings.embed_query_image()              embeddings.embed_text_query()
-    gemini-embedding-2,                          gemini-embedding-2,
-    task_type="RETRIEVAL_QUERY"                  task_type="RETRIEVAL_QUERY"
-                      │                                            │
-                      └─────────────────────┬──────────────────────┘
+  IMAGE                                          TEXT
+  ─────                                          ────
+  preprocessing.prepare_image_bytes()            text = query_text.strip()  (blank
+    — same normalization as indexing               after stripping is treated as
+                    │                               "not provided" → 400)
+                    ▼                                             │
+  reranker.is_plausibly_jewelry(bytes)                            │
+    cheap ONE-WORD gate call, BEFORE the                          │
+    expensive pipeline (§13) -- "no" short-                       │
+    circuits straight to no_match=True with                       │
+    a reason string, no embedding/search spent                    │
+                    │ "yes"                                       │
+                    ▼                                              ▼
+  embeddings.embed_image(bytes)                  cache.cache_key(text, filters) lookup
+    gemini-embedding-2, NO task_type               (§12) -- on a hit, skip straight to
+    param (§4.2 -- unsupported by this model)       vector_db.search() with the cached
+                    │                               vector; on a miss:
+                    │                               embeddings.embed_text_query(text)
+                    │                                 same model, prompts with
+                    │                                 "task: search result | query: "
+                    │                                 instead of a task_type param (§4.2),
+                    │                               then cache.set() the result
+                    │                                             │
+                    └─────────────────────┬───────────────────────┘
+                                           ▼
+                  vector_db.search()  — Pinecone ANN query against the SAME
+                    index the catalog was indexed into (top_k=20 by default),
+                    optional metadata filter ({"category": {"$eq": ...}},
+                    {"price": {"$gte"/"$lte": ...}}) — identical call shape for
+                    both paths; scores clamped to [0, 1] at the source (§5)
+                    │                                             │
+                    ▼                                             ▼
+  Filter to score >= MIN_SIMILARITY_THRESHOLD    no_match=True ONLY if raw_matches is
+    (0.55 default) BEFORE reranking -- image-      empty outright (empty catalog, or a
+    vs-image scores are reliable enough for an     filter matching nothing) -- NO absolute
+    absolute cutoff. Empty -> no_match=True,        cosine floor (Google's own guidance,
+    reranker.rerank() never called.                 and cross-modal scores run structurally
+                    │                               lower -- a real production incident
+                    │                               with a single shared threshold; §11).
+                    │                               Otherwise: reranker.score_candidates_
+                    │                               cheap(text, candidates) -- ZERO API
+                    │                               calls, blended cosine+lexical score (§6)
+                    │                                             │
+                    │                               gap = top blended_score - 3rd place's
+                    │                               (or last, if <3 candidates)
+                    │                                     │                    │
+                    │                              gap >= 0.1              gap < 0.1
+                    │                              (well separated)     (ambiguous)
+                    │                                     │                    │
+                    │                              use cheap-scored    reranker.rerank()
+                    │                              results directly   on just these
+                    │                              (no LLM call)      candidates
+                    ▼                                     │                    │
+  reranker.rerank({"type": "image", ...}, candidates)     └────────┬───────────┘
+    ALWAYS runs for image queries -- no cheap-                     │
+    scoring equivalent exists for judging visual                   │
+    traits against a photo. See §6 for the prompt.                 │
+                    │                                               │
+                    └───────────────────────┬───────────────────────┘
                                              ▼
-                      vector_db.search()  — Pinecone ANN query against the SAME
-                        index the catalog was indexed into (top_k=20 by default),
-                        optional metadata filter ({"category": {"$eq": ...}},
-                        {"price": {"$gte"/"$lte": ...}}) — identical for both paths
-                                             │
+        Every path's results (whichever ranking method produced them) are sorted by
+        reranker.final_rank_score() -- cosine score dominant, confidence a bounded
+        +/-0.05 tiebreaker, never able to override a real score gap (§6, resolved).
                                              ▼
-                      Filter to matches with score >= MIN_SIMILARITY_THRESHOLD
-                        (0.55 default) — BEFORE reranking, to avoid spending an
-                        LLM call on weak candidates that were never going to be
-                        shown. If nothing clears the bar, return no_match=True
-                        immediately; reranker.rerank() is never called.
-                                             │
-                                             ▼
-                      reranker.rerank(query, candidates)  — query is
-                        {"type": "image", "bytes": ...} or {"type": "text",
-                        "text": ...}. Single batched LLM call judging ALL
-                        surviving candidates at once. The image path judges
-                        visual traits it can see in the reference photo; the
-                        text path has no image to show the model, so it judges
-                        each candidate's stated metadata (name/category/
-                        material/caption/description/tags) against the query's
-                        terms instead — see §6 for both prompt shapes. Returns
-                        each candidate enriched with confidence (high/medium/
-                        low) + a one-line reason, sorted by (confidence tier,
-                        then cosine score) — see §6 for why this sort order is
-                        a live design tradeoff, not a settled decision.
-                                             │
-                                             ▼
-                      SearchResponse: {query_id, no_match, query_type,
+                      SearchResponse: {query_id, no_match, query_type, reason,
                         matches: [{id, similarity_percent, confidence, reason,
                         metadata}]}  — similarity_percent is the REAL cosine
-                        score * 100, never an LLM-invented number (see §6)
+                        score * 100, never an LLM-invented number (see §6);
+                        `reason` is non-null only for a domain-gate rejection
 ```
 
 ---
@@ -195,11 +229,23 @@ for why that's possible without a second embedding pipeline.
 
 ### 4.1 What actually gets embedded
 
-Every vector in this system represents **one whole image** — there is no sub-image
-chunking, and there's no text-chunking either, because this isn't a text-document RAG
-system. A jewellery photo isn't split into patches or tiles before embedding; the whole
-normalized image goes into a single `embed_content()` call and produces exactly one
-768-dimensional vector.
+There is no sub-image chunking and no text-chunking, because this isn't a text-document
+RAG system — a jewellery photo isn't split into patches or tiles before embedding.
+Query vectors (image or text) are each produced by a single `embed_content()` call.
+
+**Catalog vectors are different: they're fused, not pixels-only.**
+`embeddings.embed_catalog_item(image_bytes, text_description)` sends the normalized
+image AND a text description — `f"name: {name}. {caption}. {description}. Tags:
+{tags}."`, built from the item's own stored metadata (`main.py::
+build_catalog_text_description`) — in ONE interleaved multimodal call
+(`contents=[Part.from_bytes(...), text_description]`), producing a single vector that
+captures both pixel content and stated metadata. This exists specifically to raise
+cross-modal (text-query vs. catalog-item) cosine scores: a catalog vector built from
+pixels alone has nothing of a text query's own modality to align with beyond whatever
+the model infers purely visually — a real, measured production gap before this fix (see
+§11's history and §12's conditional-rerank cost note). Query-time image search still
+embeds the query photo alone (`embeddings.embed_image`, no text) — there's no metadata
+to fuse for an unindexed upload.
 
 **The closest analog to "chunking" here is `preprocessing.py`'s normalization step**,
 and it exists for the same underlying reason chunking strategy matters in text RAG:
@@ -225,24 +271,28 @@ similarity score, not just occasional bad matches.
 
 ### 4.2 The embedding provider
 
-`gemini-embedding-2` (`embeddings.py::embed_image`) is a natively multimodal model —
-the normalized image bytes go in, a 768-dim vector comes out, in one call. `task_type`
-is set to `RETRIEVAL_QUERY` for search-time queries and `RETRIEVAL_DOCUMENT` for
-catalog items — this is an *asymmetric* retrieval convention (the query and the thing
-being retrieved are embedded slightly differently on purpose, to optimize for "find
-documents relevant to this query" rather than "find documents identical to this
-query"). This vector is a direct function of pixel content — not a description of it.
+`gemini-embedding-2` (`embeddings.py`) is a natively multimodal model — image and/or
+text bytes go in, a 768-dim vector comes out, in one call.
+
+**`task_type` is NOT supported by this model and was previously sent for nothing.** An
+earlier version of this codebase passed `task_type="RETRIEVAL_QUERY"` /
+`"RETRIEVAL_DOCUMENT"` the way the older text-only `gemini-embedding-001` API expects —
+confirmed against the official Google docs and a filed llama_index bug report that this
+parameter is silently ignored by `gemini-embedding-2`. It has been removed from every
+call in this module; no `EmbedContentConfig` here sets it. Since there's no `task_type`
+to lean on for the query/document asymmetry, a **text query** instead gets an explicit
+task instruction baked directly into the input string:
+`f"task: search result | query: {text}"` (`embeddings.py::embed_text_query`,
+`_TEXT_QUERY_TASK_PREFIX`) — the prefix convention Google's own docs describe for this
+model. Images have no text to prefix onto and are embedded with no task hint at all
+(`embeddings.py::embed_image`).
 
 **Text search reuses the exact same model and space.** Because `gemini-embedding-2` is
-natively multimodal — not a text model and an image model bolted together — a plain
-string handed to `embed_content()` lands in the *same* 768-dim space as the image
-vectors, using the same `RETRIEVAL_QUERY` task type (`embeddings.py::embed_text_query`).
-No second Pinecone index, no second embedding call path with different dimensions, no
-provider switch: a text query is compared against the catalog's image-derived vectors
-directly. This is *not* a caption-then-embed workaround (the kind removed in §4.3/
-[ISSUES.md §2.2](../ISSUES.md#22-no-local-model-can-embed-images-directly)) — no
-intermediate text description of any catalog image is ever generated or stored; only
-the *query* is text, and it's embedded once, directly, by the same multimodal model.
+natively multimodal — not a text model and an image model bolted together — a prefixed
+query string handed to `embed_content()` lands in the *same* 768-dim space as the
+catalog's fused vectors (§4.1). No second Pinecone index, no second embedding call path
+with different dimensions, no provider switch: a text query is compared against the
+catalog's fused vectors directly.
 
 **Why not a local/offline option too?** One was built and tested: a caption-then-embed
 workaround (a local vision model describes the image in one sentence, a local
@@ -271,6 +321,11 @@ for how that was actually handled at the time. Worth remembering if another embe
 provider is ever added: **any embedding-provider change requires re-embedding the
 entire catalog**, not just switching the setting for future queries.
 
+The same principle applied within Gemini itself, not just across providers: fixing the
+task_type bug and adding text fusion (§4.1) both changed what a catalog vector actually
+represents, so every existing vector was regenerated via `scripts/reembed_catalog.py`
+(§9) rather than left mixed with new-style vectors in the same index.
+
 ---
 
 ## 5. Vector database (Pinecone)
@@ -296,6 +351,10 @@ entire catalog**, not just switching the setting for future queries.
 - **Search** (`search`): `index.query(vector, top_k, include_metadata=True, filter)`,
   reshaped into `[{"id", "score", "metadata"}, ...]`. `filter` defaults to `{}` (not
   `None`) when the caller doesn't supply one — Pinecone's API is picky about this.
+  Every score is clamped to `[0.0, 1.0]` here, at the source, before it leaves this
+  function — Pinecone's approximate cosine computation can overshoot slightly (e.g.
+  `1.004`) due to floating-point error in the ANN index; clamping once here means no
+  caller (or the frontend's `similarity_percent` display) ever has to guard against it.
 - **Listing** (for the admin UI): Pinecone's `list()` call returns IDs only, no
   metadata, and isn't designed for admin-table pagination — so `GET /api/v1/catalog/items`
   reads from `catalog_store.py`'s local JSON file instead, which is written alongside
@@ -305,98 +364,121 @@ entire catalog**, not just switching the setting for future queries.
 
 ## 6. Reranking strategy
 
-The reranker exists because raw cosine similarity alone doesn't capture everything a
-human would notice — it can rank two items close in embedding space that differ in a
-way a shopper would care about, or vice versa. `reranker.py::rerank(query, candidates)`:
+`reranker.py` has two ranking paths now, not one:
 
-0. **Takes a `query` dict, not raw bytes**, because a search can be an image or a text
-   description (§3.2): `{"type": "image", "bytes": <jpeg bytes>}` or `{"type": "text",
-   "text": <query string>}`. This branches which prompt template is used and what the
-   LLM is asked to judge, while JSON parsing, the malformed-response fallback, and
-   sorting stay identical for both:
-   - **Image query** (`_IMAGE_PROMPT_TEMPLATE`): the reference photo is sent as an
-     actual multimodal `Part` alongside the prompt. The LLM reasons about what it can
-     literally *see* — gemstone cut, metal color/finish, chain or band pattern,
-     silhouette — against a deliberately narrow metadata slice (`name`/`category`/
-     `material` only; see the token-budget note below).
-   - **Text query** (`_TEXT_PROMPT_TEMPLATE`): there is no image to send — the prompt
-     contains only the query string and each candidate's metadata. The LLM is
-     explicitly instructed to judge only whether the *stated* metadata (now widened to
-     `name`/`category`/`material`/`caption`/`description`/`tags`, since those are the
-     only place a searched-for color/material term could actually appear) matches the
-     query's terms, and told **not** to invent or assume visual details it has no way
-     to observe from text alone — this guards against the model fabricating a
-     "gemstone cut" judgment it never actually saw.
-   - Dropping the image entirely for text queries removes the single largest token
-     cost in the image path (the real contributor to a production Groq TPM error, see
-     `utils.py`'s `_CHAT_MAX_TOKENS` comment) — which should more than offset the wider
-     metadata block, but this has **not been empirically measured** against Groq's rate
-     limit the same way the image path now has been (§11).
-1. **Never invents a percentage.** The design docstring says it directly: an LLM asked
-   for "94.3% match" is producing a plausible-looking number it has no calibrated way to
-   compute. The percentage shown to users (`similarity_percent`) is always the *real*
-   cosine score. The LLM instead returns a **categorical confidence** (`high`/`medium`/
-   `low`) plus a short, concrete reason — a grounded judgment call, not a fake-precise
-   figure.
-2. **One batched call, not one call per candidate.** All surviving candidates (after
-   the similarity threshold filter) go into a single prompt, so latency and API cost
-   stay roughly constant regardless of how many candidates there are — the whole batch
-   rides on one model call, which is exactly why a slow model is a real problem: the
-   now-removed local LM Studio reranker took 96 seconds for 20 candidates, vs. Groq's
-   2 seconds for the same batch (see
-   [ISSUES.md §2.6](../ISSUES.md#26-lm-studio-reranker-calls-timed-out-on-real-non-toy-candidate-counts)
-   and [MODEL_COMPARISON.md](../MODEL_COMPARISON.md)).
-3. **Provider-switched** (`gemini` / `groq`) at the raw-text-generation step only — JSON
-   parsing, the malformed-response fallback, and sorting are identical regardless of
-   which model answered.
-4. **Sorts by `(confidence_rank, -score)`.** Confidence tier is the *primary* sort key;
-   cosine score only breaks ties within a tier. This means a wrongly "high confidence"
-   result can outrank a correctly "low confidence" one with genuinely higher cosine
-   similarity — this was observed for real (see
-   [ISSUES.md §3.5](../ISSUES.md#35-confidence-tier-first-sorting-can-rank-a-wrong-but-confident-guess-above-a-right-but-uncertain-one))
-   and is flagged here explicitly as an open design question, not a settled one.
-5. **Fails soft.** If the model's response doesn't parse as JSON (malformed, wrapped in
+- **`score_candidates_cheap(query_text, candidates)`** — the DEFAULT for text queries.
+  Zero external API calls. Blends cosine similarity with lexical overlap against each
+  candidate's stringified metadata: `blended = 0.7 * cosine_score + 0.3 * overlap`,
+  where `overlap` is the fraction of the query's (lowercased, whitespace-split) terms
+  that appear anywhere in the candidate's metadata values. Confidence buckets off the
+  blended score (`high` > 0.75, `medium` > 0.5, else `low`) — a heuristic label, not an
+  LLM judgment.
+- **`rerank(query, candidates)`** — the LLM path. `query` is `{"type": "image", "bytes":
+  <jpeg bytes>}` or `{"type": "text", "text": <query string>}`, branching which prompt
+  template is used:
+  - **Image query** (`_IMAGE_PROMPT_TEMPLATE`): the reference photo is sent as an
+    actual multimodal `Part` alongside the prompt. The LLM reasons about what it can
+    literally *see* — gemstone cut, metal color/finish, chain or band pattern,
+    silhouette — against a deliberately narrow metadata slice (`name`/`category`/
+    `material` only, to control token cost — see `utils.py`'s `_CHAT_MAX_TOKENS`
+    comment on the production Groq TPM incident this avoids).
+  - **Text query** (`_TEXT_PROMPT_TEMPLATE`): there is no image to send — the prompt
+    contains only the query string and each candidate's metadata, widened to
+    `name`/`category`/`material`/`caption`/`description`/`tags` since those are the
+    only place a searched-for color/material term could actually appear. The LLM is
+    told **not** to invent or assume visual details it has no way to observe from text
+    alone — this guards against fabricating a "gemstone cut" judgment it never saw.
+
+### Which path runs, and why (cost model)
+
+- **Image queries always use `rerank()`** — no cheap-scoring equivalent exists for
+  judging visual traits against a photo; there's nothing lexical to compare a photo
+  against. Cost per image search: 1 embedding call + 1 LLM call, unchanged.
+- **Text queries default to `score_candidates_cheap()`**, escalating to `rerank()` only
+  when results are genuinely ambiguous (`main.py`'s `_search_text`): compute the gap
+  between the top result's `blended_score` and the 3rd-place result's (or the last
+  available, if fewer than 3 candidates). A gap `>= 0.1` means the top results are
+  clearly separated — use the cheap-scored results directly, `rerank()` is never
+  called. A gap `< 0.1` means the top results are too close to trust a heuristic blend
+  — escalate to a real LLM judgment on just those candidates. Each search logs which
+  path ran at INFO level (`"text search: cheap path used"` / `"text search: LLM rerank
+  triggered, gap=..."`) so this is observable in production without extra
+  instrumentation.
+  **Cost impact: most text searches now cost 1 embedding call + 0 LLM calls**, down
+  from 1 embedding + 1 LLM call for every search before this change (and a text-query
+  cache hit — §12 — drops even the embedding call for a repeated query).
+
+### Shared properties of both paths
+
+1. **Never invents a percentage.** The percentage shown to users (`similarity_percent`)
+   is always the *real* cosine score (clamped at the source — §5). Both ranking paths
+   produce a **categorical confidence** (`high`/`medium`/`low`) plus a short reason
+   instead — a grounded (or heuristic) judgment, never a fake-precise figure.
+2. **`rerank()`'s LLM call is always batched**, not one call per candidate — see
+   [MODEL_COMPARISON.md](../MODEL_COMPARISON.md) for measured latency across providers.
+   Provider-switched (`gemini` / `groq`) at the raw-text-generation step only; JSON
+   parsing, the malformed-response fallback, and sorting are identical either way.
+3. **Sorting is unified and RESOLVED (previously an open question).**
+   `reranker.final_rank_score(candidate) = candidate["score"] + CONFIDENCE_WEIGHT[confidence]`,
+   with `CONFIDENCE_WEIGHT = {"high": 0.05, "medium": 0.0, "low": -0.05}` — ONE shared
+   function, imported and used by both `rerank()` and `score_candidates_cheap()`, not
+   two independently-maintained sorts that could drift apart. This replaced the
+   previous `(confidence_rank, -score)` scheme, where confidence tier was the *primary*
+   sort key and cosine score only broke ties within a tier — that let a wrongly "high
+   confidence" result outrank a correctly "low confidence" one with genuinely higher
+   cosine similarity, observed for real (a high-scoring result landing 6th; see
+   [ISSUES.md §3.5](../ISSUES.md#35-confidence-tier-first-sorting-can-rank-a-wrong-but-confident-guess-above-a-right-but-uncertain-one)).
+   `final_rank_score` fixes this by making confidence a **bounded tiebreaker**: it can
+   nudge a close call (a 0.60 "high" edges out a 0.58 "medium") but can never override a
+   real score gap (a 0.75 "medium" still outranks a 0.55 "high": 0.75 vs. 0.60). Cosine
+   score is the actual retrieval signal and should dominate; confidence is the LLM's
+   (or heuristic's) read on it and should only refine.
+4. **Fails soft.** If the model's response doesn't parse as JSON (malformed, wrapped in
    markdown fences, or — as found with Groq's reasoning model — cut off mid-`<think>`
    block with no answer at all), every candidate falls back to
    `confidence="medium", reason="no reranker judgment available"` rather than the whole
    search failing. A `<think>...</think>`-stripping step runs before parsing, as
    defensive insurance for any reasoning-style model.
-6. **Empty input short-circuits before any LLM call** — `rerank([])` returns `[]`
-   immediately, which matters for cost: a `no_match` search never spends a reranker call
-   on candidates that already didn't clear the similarity bar.
+5. **Empty input short-circuits before any LLM call** in both `rerank([])` and
+   `score_candidates_cheap()` — matters for cost: a `no_match` search never spends a
+   reranker call on candidates that already didn't clear the bar (image queries) or on
+   an empty result set (text queries).
 
 ---
 
-## 7. Job tracking & the local catalog store
+## 7. Job tracking & the catalog store
 
-Two pieces of state exist outside Pinecone, both **in-process and single-instance**:
+Two pieces of state exist outside Pinecone:
 
-- **`_jobs`** (a plain dict in `main.py`): `job_id -> {status, total, processed,
-  failed_items}`. Written to by `_index_job` as it processes each item; read by
-  `GET /api/v1/catalog/jobs/{job_id}`. `status` is `"pending"` while running, `"done"`
-  once every item has been *attempted* (even if some failed — partial success still
-  counts as done), `"failed"` only if *every single item* failed.
-- **`catalog_store.py`**: a JSON file (`catalog_store.json`) mapping `item_id ->
-  metadata`, written alongside every Pinecone upsert. Exists purely because Pinecone
-  isn't a good fit for "list everything, paginated" — its own listing API returns IDs
-  without metadata.
-
-**Both are explicitly a v1 tradeoff, not a production design**: an in-memory dict
-disappears on restart, and neither is shared across multiple backend processes. Move to
-Redis (or a real table) before running more than one backend instance — a second
-instance, or a restart, simply won't see jobs or catalog entries another instance
-recorded.
+- **`_jobs`** (a plain dict in `main.py`, **in-process and single-instance**):
+  `job_id -> {status, total, processed, failed_items}`. Written to by `_index_job` as it
+  processes each item; read by `GET /api/v1/catalog/jobs/{job_id}`. `status` is
+  `"pending"` while running, `"done"` once every item has been *attempted* (even if some
+  failed — partial success still counts as done), `"failed"` only if *every single item*
+  failed. This is explicitly a v1 tradeoff, not a production design: it disappears on
+  restart and isn't shared across multiple backend processes — move to Redis (or a real
+  queue) before running more than one backend instance, or a second instance (or a
+  restart) simply won't see jobs another instance recorded.
+- **`catalog_store.py`**: item metadata (`item_id -> metadata`) mirrored into a Supabase
+  `catalog_items` table alongside every Pinecone upsert (`record_item`), read back
+  paginated for `GET /api/v1/catalog/items` (`list_items`) and by
+  `scripts/reembed_catalog.py` as the metadata source of truth for a full re-embed (§4.3,
+  §9). Exists purely because Pinecone isn't a good fit for "list everything, paginated"
+  — its own listing API returns IDs without metadata. Unlike `_jobs`, this IS shared
+  across instances/restarts, since Supabase is external persistent storage — the earlier
+  local-JSON-file version of this module was replaced for exactly that reason.
+  `backend/catalog_store.json` still exists in the repo as the one-time migration
+  source for `scripts/migrate_catalog_to_supabase.py`, not as a live data path anymore.
 
 ### Catalog images are committed to the repo
 
-`backend/static/catalog/*.jpg` (the served images) and `backend/catalog_store.json`
-are tracked in git, not ignored — a deliberate exception to "runtime state doesn't
-belong in the repo." This was forced by a real deployment problem: Render's disk is
-ephemeral (see `DEPLOYMENT.md` §1), so images written at indexing time vanished on
-every restart, breaking every thumbnail even though search itself kept working (the
-Pinecone vectors + `image_url` metadata are unaffected by a restart — only the actual
-image files were gone). Committing the current set means it ships with every deploy
-regardless of restarts.
+`backend/static/catalog/*.jpg` (the served images) is tracked in git, not ignored — a
+deliberate exception to "runtime state doesn't belong in the repo." This was forced by a
+real deployment problem: Render's disk is ephemeral (see `DEPLOYMENT.md` §1), so images
+written at indexing time vanished on every restart, breaking every thumbnail even though
+search itself kept working (the Pinecone vectors + `image_url` metadata are unaffected
+by a restart — only the actual image files were gone). Committing the current set means
+it ships with every deploy regardless of restarts.
 
 This only covers whatever was committed. Any item added through the live `/catalog`
 admin page afterward is still written only to the running container's disk and is
@@ -459,17 +541,20 @@ npm run dev   # http://localhost:5173
 | --- | --- |
 | `LLM_PROVIDER` | `gemini` or `groq` — see §6 |
 | `EMBEDDING_DIMENSIONS` | Must match what `gemini-embedding-2` actually outputs, and must match the Pinecone index's fixed dimension |
-| `TOP_K` | How many ANN candidates `vector_db.search()` retrieves before threshold filtering |
-| `MIN_SIMILARITY_THRESHOLD` | Cosine score floor for **image** queries before a candidate is even sent to the reranker |
-| `MIN_SIMILARITY_THRESHOLD_TEXT` | Cosine score floor for **text** queries — deliberately lower than `MIN_SIMILARITY_THRESHOLD`; cross-modal (text-vs-image) cosine scores run lower in absolute terms even for true matches (§11) |
-| `GROQ_CHAT_TIMEOUT_SECONDS` | Must be generous enough for a full `TOP_K`-candidate batch in one prompt, not just a single small request (see §6, point 2) — Groq's cloud inference needs far less headroom here than the local model that used to fill this role did |
+| `TOP_K` | How many ANN candidates `vector_db.search()` retrieves; also the cap on how many text candidates `score_candidates_cheap`/`rerank` see (§6) |
+| `MIN_SIMILARITY_THRESHOLD` | Cosine score floor for **image** queries only before a candidate is sent to the reranker. Text queries have NO absolute floor — see §3.2/§11 |
+| `REDIS_URL` | Empty = `InMemoryCache` (single-instance stopgap, §12). Set to a real Redis URL (a free [Upstash](https://upstash.com) database works) to switch to `RedisCache` automatically |
+| `GROQ_CHAT_TIMEOUT_SECONDS` | Must be generous enough for a full `TOP_K`-candidate batch in one prompt, not just a single small request (see §6) — Groq's cloud inference needs far less headroom here than the local model that used to fill this role did |
 | `GROQ_MODEL` | Whatever vision-capable model is available on the account; verify via `GET /v1/models`, don't assume a name |
+| `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | Catalog metadata table (§7) — required, no fallback |
 
 ### Scripts (`scripts/`)
 
 | Script | Purpose |
 | --- | --- |
 | `smoke_test.py` | End-to-end flow, fully mocked, no real API keys — for CI/quick sanity checks |
+| `reembed_catalog.py` | ⚠️ **Destructive full-catalog overwrite.** Re-embeds every already-indexed item with the current `embed_catalog_item` (fused image+text) and upserts under the same `item_id`s, replacing every existing vector in Pinecone. Needed any time the embedding process itself changes (task_type fix, adding text fusion — see §4.3) since old and new vectors aren't comparable in the same index. **Always run `--dry-run` first** to verify the item count and see what would be upserted before committing to the real run |
+| `migrate_catalog_to_supabase.py` | One-off: copies every item from the legacy local `catalog_store.json` into the Supabase `catalog_items` table. Safe to re-run (upserts by `item_id`) |
 | `compare_rerankers.py` | Runs the exact same candidate set through both reranker providers (Gemini, Groq) back-to-back and prints a side-by-side comparison — how [MODEL_COMPARISON.md](../MODEL_COMPARISON.md)'s reranker numbers were actually produced |
 | `backfill_image_urls.py` | One-off: adds `image_url` metadata to already-indexed items without re-embedding (uses Pinecone's merge-semantics `update()`, not `upsert()`) |
 | `fetch_sample_images.py` | Downloads a small set of properly-licensed (Wikimedia Commons) sample jewellery photos for local testing |
@@ -492,11 +577,12 @@ python scripts/smoke_test.py
 
 ## 11. Known limitations / production considerations
 
-- Job tracking and the catalog store are in-memory/single-file — move to Redis/a real
-  DB before running more than one backend instance (§7).
-- The reranker's confidence-tier-first sort can let a wrong LLM judgment override a
-  correct cosine-similarity signal (§6, point 4) — worth reconsidering the sort
-  weighting before relying on it for real merchandising decisions.
+- `_jobs` (indexing progress) is in-memory/single-instance — move to Redis/a real queue
+  before running more than one backend instance (§7). The catalog store itself no
+  longer has this limitation (Supabase, §7).
+- ~~The reranker's confidence-tier-first sort can let a wrong LLM judgment override a
+  correct cosine-similarity signal~~ — **RESOLVED.** `final_rank_score()` replaced the
+  confidence-tier-first sort with a bounded additive weight; see §6, point 3.
 - There is no offline/no-API-key fallback anymore — both `GEMINI_API_KEY` and (if
   `LLM_PROVIDER=groq`) `GROQ_API_KEY` are required. A local caption-then-embed path
   existed and worked but was removed after comparison showed it was measurably less
@@ -509,22 +595,117 @@ python scripts/smoke_test.py
 - `BackgroundTasks` (stdlib, in-process) is fine at this scale; swap for a real queue
   (Celery/RQ/Cloud Tasks) before indexing volume grows large enough that a backend
   restart mid-batch becomes a real operational risk.
-- **Text-query cosine scores run systematically lower than image-query ones — this WAS
-  measured against the live production catalog** (unlike the untested
-  `gemini-2.5-flash` reranker caveat above) after text search initially returned
-  `no_match` for every real query in production. `embed_text_query()` does correctly
-  encode color/material/style terms — e.g. "gold jhumka earrings" against the live
-  catalog ranked every genuine earring above every necklace/bracelet, and the actual
-  hand-named "royal-traditional-indian-jhumka" item near the top for a matching query —
-  but the *absolute* cosine magnitude for a true cross-modal (text query vs.
-  image-derived catalog vector) match tops out around 0.40-0.47, not the ~0.55+ seen for
-  genuine image-vs-image matches. `MIN_SIMILARITY_THRESHOLD` (image queries) and
-  `MIN_SIMILARITY_THRESHOLD_TEXT` (text queries, default `0.35`) are now separate
-  settings (`config.py`) for exactly this reason — using one threshold for both silently
-  zeroed out all text search results. The lower text bar is safe specifically because
-  the reranker's metadata-based judgment (§6) is the actual precision filter for text
-  queries; the cosine threshold's only job is skipping a reranker call on true noise, and
-  0.35 was chosen with margin below the observed 0.40 point where irrelevant categories
-  start blending in. This split has NOT been tuned against a broader, more diverse
-  catalog or a wider range of query phrasing — revisit if false positives become a
-  problem as the catalog grows.
+- **Text search: how the no-`no_match`-for-low-scores fix actually evolved.** Text
+  queries were compared cross-modal (text vector vs. image-derived catalog vectors) and
+  measured lower in absolute cosine score than image-vs-image comparisons — confirmed
+  against the live production catalog after text search initially returned `no_match`
+  for every real query. The first fix was a separate, lower `MIN_SIMILARITY_THRESHOLD_TEXT`
+  (0.35). This consolidation pass replaced that entirely: text queries now use fused
+  catalog embeddings (§4.1, which measurably raises cross-modal scores) and have **no
+  absolute cosine floor at all** — filtering is rank-based (`score_candidates_cheap`'s
+  blended score + the conditional LLM-rerank gap check, §6), matching Google's own
+  guidance against a fixed cutoff for this model. `MIN_SIMILARITY_THRESHOLD_TEXT` no
+  longer exists as a setting.
+- **`score_candidates_cheap`'s lexical overlap is naive**: a plain substring check
+  against stringified metadata values, no stemming, no synonym matching, no handling
+  for multi-word phrases as a unit. "gold" won't match "golden"; "diamond ring" as a
+  two-word query gets scored as two independent single-word overlaps. This is
+  acceptable because it's a coarse pre-filter for the ambiguity-gap check (§6), not the
+  final word on ranking — genuinely ambiguous results still get a real LLM judgment.
+- **The 0.1 conditional-rerank gap threshold (§6) is a starting heuristic, not an
+  empirically tuned value.** It has not been measured against a labeled set of "should
+  have escalated to LLM" vs. "was fine with the cheap path" real queries — if text
+  search quality complaints emerge in production, check whether the gap threshold
+  itself (rather than the scoring formula) is the actual problem before changing the
+  formula.
+
+See also §12 (caching) and §13 (image domain gating) for their own limitations.
+
+---
+
+## 12. Caching (`cache.py`)
+
+Text queries embed the query string on every search unless the exact same query (text
+and metadata filter) has been searched recently — `cache.py` exists to skip that repeat
+embedding call.
+
+- **`SearchCache`** (`abc.ABC`): a two-method interface, `get(key) -> vector | None` and
+  `set(key, vector, ttl_seconds=3600) -> None`. Both concrete implementations below only
+  ever get called through this interface — nothing in `main.py` touches
+  `InMemoryCache`/`RedisCache` directly.
+- **`InMemoryCache`**: a process-local dict with TTL eviction, checked lazily on `get()`
+  (no background sweep). This is a single-instance stopgap with **exactly the same
+  limitation already documented for `_jobs` in §7**: it disappears on restart and isn't
+  shared across multiple backend processes — a second instance won't see another
+  instance's cached vectors, so cache hit rate degrades (but correctness doesn't — a
+  miss just re-embeds) as soon as more than one backend process is running. Used
+  automatically whenever `REDIS_URL` isn't set.
+- **`RedisCache`**: the real, multi-instance-safe implementation — a thin wrapper over
+  `redis-py`, storing each vector as a JSON string with Redis's own `EX` TTL. Connection
+  is lazy (`redis.from_url()` doesn't connect until the first command), so a bad/missing
+  `REDIS_URL` fails on first use, not at import time. **Free hosting exists**: Upstash
+  (<https://upstash.com>) gives a serverless Redis database on its free tier (no credit
+  card, 10K commands/day, 256MB) — copy its `rediss://` connection URL into `REDIS_URL`
+  and it works with no code change, since `_make_cache()` (`cache.py`) picks
+  `RedisCache` over `InMemoryCache` automatically whenever `settings.redis_url` is
+  non-empty.
+- **`cache_key(query_text, filters)`**: `sha256` of the lowercased/stripped query text
+  plus the metadata filter dict (JSON-serialized with `sort_keys=True`, so key order in
+  the filter dict doesn't produce a different cache key for an equivalent filter).
+  Different filters for the same text string are different cache entries on purpose —
+  `"gold ring"` filtered to `category=ring` is a different search than `"gold ring"`
+  filtered to `category=necklace`.
+- **Wiring** (`main.py::_search_text`): before calling `embeddings.embed_text_query()`,
+  check `cache._cache.get(cache_key(text, metadata_filter))`; on a hit, skip the
+  embedding call entirely and go straight to `vector_db.search()` with the cached
+  vector; on a miss, embed normally and `cache._cache.set()` the result. **Image queries
+  are NOT cached** — repeat identical image uploads are rare, and hashing image bytes
+  for a cache key is out of scope here.
+
+**Limitation**: no cache invalidation exists. If a catalog item's metadata changes (or
+the item is removed) within a cached vector's TTL, a cached search still returns
+whatever `vector_db.search()` finds for that stale vector — this is generally fine since
+the *query* vector doesn't depend on catalog contents, but worth knowing if catalog
+churn and search-result staleness ever need to be reasoned about together.
+
+---
+
+## 13. Domain gating for image queries (`reranker.is_plausibly_jewelry`)
+
+**The problem this fixes**: nothing in the pipeline previously verified a query image
+was actually jewellery before running the full embed → search → rerank flow. A shared
+general-purpose embedding space has enough ambient/positive cosine bias that an
+unrelated photo (a puppy, a car, a landscape) can still clear `MIN_SIMILARITY_THRESHOLD`
+against SOME catalog item — and the reranker's confidence buckets aren't designed to say
+"none of these are remotely relevant," only to rank what's already been retrieved
+relative to each other. Retrieving nonsense still produces confidently-labeled nonsense.
+
+**The fix**: `reranker.is_plausibly_jewelry(image_bytes)` runs BEFORE
+`embeddings.embed_image()` for every image query (`main.py::_search_image`) — a single,
+cheap, tightly-constrained classification call (`max_output_tokens=5`, reuses the
+existing `settings.reranker_model`, no new provider) asking exactly one question:
+"Does this image show a piece of jewellery ... as the main subject? Answer with exactly
+one word: yes or no." A "no" short-circuits straight to `no_match=True` with
+`reason="The uploaded photo doesn't appear to show a piece of jewellery."` — no
+embedding call, no Pinecone query, no rerank call spent on it. This doubles as a cost
+optimization for exactly that reason.
+
+**Explicitly does NOT apply to text queries.** There's no image to classify, and a
+short or vague text query (e.g. "gold") isn't the same failure mode as an entirely
+unrelated photo — rejecting it outright would be a false-positive-prone overreach in a
+way the image case isn't.
+
+**This is a heuristic gate, not a guarantee.** A single fast classification call can
+produce both:
+
+- **False negatives** — real jewellery rejected, most likely for an unusually abstract,
+  sculptural, or non-standard piece the model doesn't confidently recognize as
+  jewellery from a photo alone.
+- **False positives** — a genuinely ambiguous but non-jewellery photo passing through
+  and proceeding to the full (wasted) search pipeline.
+
+Neither failure mode has been measured against a labeled set of real product photos
+this session. Before trusting this gate for a real product surface, measure its
+false-negative rate on real (including unusual/abstract) jewellery photos — a gate that
+silently rejects legitimate customer uploads is a worse user experience than the puppy
+photo problem it's meant to solve.

@@ -33,7 +33,7 @@ def run_with_provider(provider: str, query_image_bytes: bytes, candidates: list[
     settings.llm_provider = provider
     try:
         t0 = time.time()
-        ranked = reranker.rerank(query_image_bytes, candidates)
+        ranked = reranker.rerank({"type": "image", "bytes": query_image_bytes}, candidates)
         elapsed = time.time() - t0
         return ranked, elapsed
     finally:
@@ -59,7 +59,7 @@ def main() -> int:
     clean = prepare_image_bytes(raw)
 
     print("Embedding query image...", flush=True)
-    query_vector = embeddings.embed_query_image(clean)
+    query_vector = embeddings.embed_image(clean)
 
     print("Searching catalog...", flush=True)
     raw_matches = vector_db.search(query_vector, metadata_filter=None)

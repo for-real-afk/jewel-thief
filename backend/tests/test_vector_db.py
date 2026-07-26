@@ -79,3 +79,35 @@ def test_search_without_filter_uses_empty_dict_not_none(mocker):
     kwargs = mock_index.query.call_args.kwargs
     assert kwargs["filter"] == {}
     assert kwargs["filter"] is not None
+
+
+def test_search_clamps_score_overshoot_to_1(mocker):
+    # Pinecone's approximate cosine computation can overshoot slightly past
+    # 1.0 due to floating-point error in the ANN index.
+    mock_index = mocker.Mock()
+    mock_index.query.return_value = {"matches": [{"id": "a", "score": 1.004, "metadata": {}}]}
+    mocker.patch.object(vector_db, "get_or_create_index", return_value=mock_index)
+
+    results = vector_db.search([0.1, 0.2])
+
+    assert results[0]["score"] == 1.0
+
+
+def test_search_clamps_negative_score_to_0(mocker):
+    mock_index = mocker.Mock()
+    mock_index.query.return_value = {"matches": [{"id": "a", "score": -0.001, "metadata": {}}]}
+    mocker.patch.object(vector_db, "get_or_create_index", return_value=mock_index)
+
+    results = vector_db.search([0.1, 0.2])
+
+    assert results[0]["score"] == 0.0
+
+
+def test_search_leaves_in_range_score_unchanged(mocker):
+    mock_index = mocker.Mock()
+    mock_index.query.return_value = {"matches": [{"id": "a", "score": 0.734, "metadata": {}}]}
+    mocker.patch.object(vector_db, "get_or_create_index", return_value=mock_index)
+
+    results = vector_db.search([0.1, 0.2])
+
+    assert results[0]["score"] == 0.734

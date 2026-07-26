@@ -2,11 +2,26 @@
 Multimodal embedding generation via gemini-embedding-2.
 
 gemini-embedding-2 is a natively multimodal preview model (text, image, video,
-audio, documents in one vector space). Its request shape may differ from the
-older text-only gemini-embedding-001 API (e.g. the RETRIEVAL_QUERY /
-RETRIEVAL_DOCUMENT task_type convention was designed for text embeddings) —
-verify the current API reference for this model before relying on task_type
-being interpreted the same way for image inputs.
+audio, documents in one vector space). IMPORTANT: task_type is NOT supported
+by this model and is silently ignored if passed — confirmed against the
+official Google docs and a filed llama_index bug report. (An earlier version
+of this module passed task_type="RETRIEVAL_QUERY"/"RETRIEVAL_DOCUMENT" the
+way the older text-only gemini-embedding-001 API expects; that parameter was
+doing nothing.) Since there's no task_type to lean on for asymmetric
+query/document encoding, a TEXT query instead gets an explicit task
+instruction baked directly into the input string ("task: search result |
+query: ..." — see embed_text_query). Images have no text to prefix onto and
+are embedded with no task hint at all.
+
+Catalog items are embedded with TEXT FUSION: embed_catalog_item() sends the
+image bytes and a text description (name/caption/description/tags) in one
+interleaved multimodal call, producing a single vector that captures both
+pixel content and stated metadata. This exists specifically to raise
+cross-modal (text-query vs. catalog-item) cosine scores — a catalog vector
+built from pixels alone has nothing of a text query's own modality to align
+with beyond whatever the model infers visually, which is the structural
+reason text search cosine scores ran lower than image search's ever could
+(see README.md §11 for the measured gap before this fix).
 
 Gemini is the only embedding provider: it's the only one of this project's
 providers with an image-embedding endpoint (Groq has none). An LM Studio
@@ -28,56 +43,52 @@ _CAPTION_PROMPT = (
     "metal color/finish, chain or band pattern, and overall silhouette. No opinions."
 )
 
+_TEXT_QUERY_TASK_PREFIX = "task: search result | query: "
+
 
 @external_api_retry
-def embed_image(image_bytes: bytes, task_type: str = "RETRIEVAL_DOCUMENT") -> list[float]:
-    """Embed a single image into the shared multimodal vector space."""
+def embed_image(image_bytes: bytes) -> list[float]:
+    """Embed a single query image — used for query-time image search only.
+    No task_type parameter: unsupported by gemini-embedding-2 (see module
+    docstring), so none is sent."""
     response = _client.models.embed_content(
         model=settings.embedding_model,
         contents=types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-        config=types.EmbedContentConfig(
-            output_dimensionality=settings.embedding_dimensions,
-            task_type=task_type,
-        ),
+        config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
     )
     return response.embeddings[0].values
-
-
-def embed_query_image(image_bytes: bytes) -> list[float]:
-    """Convenience wrapper for a search-query image (as opposed to a catalog item)."""
-    return embed_image(image_bytes, task_type="RETRIEVAL_QUERY")
 
 
 @external_api_retry
 def embed_text_query(text: str) -> list[float]:
-    """Embed a natural-language search query into the SAME vector space as
-    catalog images. gemini-embedding-2 is natively multimodal — text and
-    images already share one 768-dim space, so a text query embedded with
-    RETRIEVAL_QUERY is directly comparable against the catalog's
-    RETRIEVAL_DOCUMENT image vectors with no separate index or provider
-    needed. Whether the model actually encodes material/color terms (e.g.
-    "pink enamel") close enough to matching catalog images in that shared
-    space hasn't been measured — see README.md's Known Limitations."""
+    """Embed a natural-language search query. Since gemini-embedding-2 has no
+    task_type parameter, the query/document asymmetry is instead encoded as a
+    prompt prefix on the input string itself — the convention Google's docs
+    describe for this model. No task_type parameter is sent."""
+    prefixed = f"{_TEXT_QUERY_TASK_PREFIX}{text}"
     response = _client.models.embed_content(
         model=settings.embedding_model,
-        contents=text,
-        config=types.EmbedContentConfig(
-            output_dimensionality=settings.embedding_dimensions,
-            task_type="RETRIEVAL_QUERY",
-        ),
+        contents=prefixed,
+        config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
     )
     return response.embeddings[0].values
 
 
-def embed_catalog_image(image_bytes: bytes) -> list[float]:
-    """Convenience wrapper for a catalog item being indexed."""
-    return embed_image(image_bytes, task_type="RETRIEVAL_DOCUMENT")
-
-
-def embed_batch_catalog_images(images: list[bytes]) -> list[list[float]]:
-    """Embed multiple catalog images. Sequential for clarity; parallelize with
-    asyncio/gather behind a semaphore if indexing volume demands it."""
-    return [embed_catalog_image(img) for img in images]
+@external_api_retry
+def embed_catalog_item(image_bytes: bytes, text_description: str) -> list[float]:
+    """THE catalog indexing function. Sends the image and a text description
+    of the item in one interleaved multimodal call, producing a single fused
+    vector per item — not two vectors, not an average of two separate calls.
+    Callers build text_description from the item's stored metadata, e.g.
+    f"name: {name}. {caption}. {description}. Tags: {', '.join(tags)}." — see
+    main.py's _index_job and scripts/reembed_catalog.py for the exact shape
+    used against real catalog metadata. No task_type parameter is sent."""
+    response = _client.models.embed_content(
+        model=settings.embedding_model,
+        contents=[types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"), text_description],
+        config=types.EmbedContentConfig(output_dimensionality=settings.embedding_dimensions),
+    )
+    return response.embeddings[0].values
 
 
 @external_api_retry

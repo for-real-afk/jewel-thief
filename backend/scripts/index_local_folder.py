@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import embeddings
 import vector_db
-from main import infer_category
+from main import build_catalog_text_description, infer_category
 from preprocessing import prepare_image_bytes, InvalidImageError
 
 MANIFEST_DIR = Path(__file__).resolve().parent.parent / "sample_data" / "real_catalog"
@@ -83,7 +83,8 @@ def main() -> int:
         try:
             raw = path.read_bytes()
             clean = prepare_image_bytes(raw)
-            vector = embeddings.embed_catalog_image(clean)
+            text_description = build_catalog_text_description(stem, "", "", [])
+            vector = embeddings.embed_catalog_item(clean, text_description)
         except InvalidImageError as exc:
             print(f"  -> SKIPPED (invalid image): {exc}", flush=True)
             failed.append({"file": path.name, "error": str(exc)})
