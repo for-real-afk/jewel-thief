@@ -8,7 +8,7 @@ admin UI can page through metadata without touching the vector index.
 """
 from supabase import create_client
 
-from config import get_settings
+from .config import get_settings
 
 settings = get_settings()
 _client = create_client(settings.supabase_url, settings.supabase_key)

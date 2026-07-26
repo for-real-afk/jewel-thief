@@ -41,7 +41,7 @@ import requests
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
-from main import infer_category  # noqa: E402
+from app.main import infer_category  # noqa: E402
 WIKIMEDIA_MANIFEST = BACKEND_DIR / "sample_data" / "catalog" / "metadata.json"
 WIKIMEDIA_SOURCE_DIR = BACKEND_DIR / "sample_data" / "catalog"
 LOCAL_MANIFEST = BACKEND_DIR / "sample_data" / "real_catalog" / "metadata.json"

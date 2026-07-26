@@ -1,6 +1,6 @@
 import pytest
 
-import api_keys
+from app import api_keys
 
 
 class _FakeResult:

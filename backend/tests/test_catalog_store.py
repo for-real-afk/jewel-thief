@@ -1,6 +1,6 @@
 import pytest
 
-import catalog_store
+from app import catalog_store
 
 
 class _FakeResult:

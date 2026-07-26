@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import vector_db
+from app import vector_db
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 STATIC_CATALOG_DIR = BACKEND_DIR / "static" / "catalog"

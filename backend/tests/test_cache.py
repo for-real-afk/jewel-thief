@@ -1,6 +1,6 @@
 import pytest
 
-import cache
+from app import cache
 
 
 def test_in_memory_cache_set_then_get_returns_value():
@@ -135,9 +135,9 @@ def test_search_cache_hit_skips_embed_text_query(mocker):
     """End-to-end: an identical second text search must not call
     embeddings.embed_text_query at all -- it should be served entirely from
     cache.py's InMemoryCache."""
-    import embeddings
-    import main
-    import vector_db
+    from app import embeddings
+    from app import main
+    from app import vector_db
 
     mocker.patch.object(cache, "_cache", cache.InMemoryCache())
     mock_embed = mocker.patch.object(embeddings, "embed_text_query", return_value=[0.1] * 8)

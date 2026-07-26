@@ -33,7 +33,7 @@ If not using the Blueprint: **New → Web Service**, connect the repo, then set:
 | Root Directory | `backend` |
 | Runtime | Python 3 |
 | Build Command | `pip install -r requirements.txt` |
-| Start Command | `uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers` |
+| Start Command | `uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers` |
 | Health Check Path | `/health` |
 
 Then add the same env vars listed in `render.yaml`'s `envVars` section by hand.
@@ -53,7 +53,7 @@ every thumbnail even though search itself kept working fine (the vectors +
 `image_url` metadata live in Pinecone, unaffected by a Render restart —
 only the actual image *files* were gone).
 
-**Current fix**: `backend/static/catalog/*.jpg` (the full image set at time
+**Current fix**: `backend/app/static/catalog/*.jpg` (the full image set at time
 of writing) and `backend/catalog_store.json` are committed directly into the
 repo instead of being left as runtime-only state — see the "Catalog images
 are committed to the repo" note in `README.md` §7. They now ship with every
@@ -174,13 +174,13 @@ only testing in-app navigation.
   every real credential is `sync: false` (Render prompts, stores encrypted)
   or set directly in Vercel's dashboard.
 - The catalog image set at time of writing is committed into the repo
-  (`backend/static/catalog/`), so it survives Render restarts — see §1 above.
+  (`backend/app/static/catalog/`), so it survives Render restarts — see §1 above.
 
 **Known gaps, not addressed here** (see `README.md` §11 and §1 above for
 detail — these are pre-existing architecture tradeoffs, not deployment bugs):
 
 - Any catalog item added through the live `/catalog` admin page *after* the
-  last commit of `backend/static/catalog/` is still runtime-only and does
+  last commit of `backend/app/static/catalog/` is still runtime-only and does
   not survive a restart/redeploy — only the committed set does.
 - The in-memory `_jobs` dict (indexing job status) is never disk-based and
   is lost on every restart regardless.

@@ -12,4 +12,4 @@ COPY . .
 # defaults to 8000 for a plain `docker run` with no PORT set.
 ENV PORT=8000
 EXPOSE 8000
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT} --proxy-headers
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers

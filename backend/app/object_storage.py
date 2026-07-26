@@ -15,8 +15,8 @@ way since both speak the S3 API via boto3.
 import boto3
 from botocore.config import Config
 
-from config import get_settings
-from utils import external_api_retry
+from .config import get_settings
+from .utils import external_api_retry
 
 settings = get_settings()
 

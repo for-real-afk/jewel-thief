@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import embeddings
+from app import embeddings
 
 FAKE_VECTOR = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
 

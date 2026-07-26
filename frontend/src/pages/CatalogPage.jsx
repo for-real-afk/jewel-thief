@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import TopNav from "./TopNav.jsx";
-import { ShimmerLine } from "./App.jsx";
+import TopNav from "../TopNav.jsx";
+import ShimmerLine from "../components/ShimmerLine.jsx";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const API_KEY = import.meta.env.VITE_API_KEY || "";
@@ -209,7 +209,7 @@ function EditItemModal({ itemId, fields, imagePreviewUrl, saving, error, onChang
   );
 }
 
-export default function CatalogUpload() {
+export default function CatalogPage() {
   const [rows, setRows] = useState([]);
   const [bulkCategory, setBulkCategory] = useState("");
   const [bulkTags, setBulkTags] = useState("");

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
-import TopNav from "./TopNav.jsx";
+import TopNav from "../TopNav.jsx";
+import ShimmerLine from "../components/ShimmerLine.jsx";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
 const API_KEY = import.meta.env.VITE_API_KEY || "";
@@ -140,10 +141,6 @@ function ResultCard({ match, onOpenDetail }) {
   );
 }
 
-export function ShimmerLine() {
-  return <div className="shimmer-line" aria-label="Searching" role="status" />;
-}
-
 function Lightbox({ image, onClose }) {
   useEffect(() => {
     const onKey = (e) => e.key === "Escape" && onClose();
@@ -197,7 +194,7 @@ function ItemModal({ item, onClose }) {
   );
 }
 
-export default function App() {
+export default function SearchPage() {
   const [messages, setMessages] = useState(loadStoredMessages);
   const [pendingImage, setPendingImage] = useState(null);
   const [inputText, setInputText] = useState("");

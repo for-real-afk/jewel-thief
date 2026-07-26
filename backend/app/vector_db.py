@@ -3,8 +3,8 @@ Pinecone vector database: index setup, batch upsert, filtered ANN search.
 """
 from pinecone import Pinecone, ServerlessSpec
 
-from config import get_settings
-from utils import external_api_retry
+from .config import get_settings
+from .utils import external_api_retry
 
 settings = get_settings()
 _pc = Pinecone(api_key=settings.pinecone_api_key)

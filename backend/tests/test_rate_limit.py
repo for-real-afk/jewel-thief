@@ -1,6 +1,6 @@
 import pytest
 
-import rate_limit
+from app import rate_limit
 
 
 class _FakeRedis:

@@ -17,11 +17,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import embeddings
-import reranker
-import vector_db
-from config import get_settings
-from preprocessing import prepare_image_bytes
+from app import embeddings
+from app import reranker
+from app import vector_db
+from app.config import get_settings
+from app.preprocessing import prepare_image_bytes
 
 settings = get_settings()
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import catalog_store
+from app import catalog_store
 
 LEGACY_STORE_PATH = Path(__file__).resolve().parent.parent / "catalog_store.json"
 

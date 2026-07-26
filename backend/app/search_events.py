@@ -20,7 +20,7 @@ from uuid import uuid4
 
 from supabase import create_client
 
-from config import get_settings
+from .config import get_settings
 
 settings = get_settings()
 _client = create_client(settings.supabase_url, settings.supabase_key)

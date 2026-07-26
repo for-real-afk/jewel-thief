@@ -6,7 +6,7 @@ import requests
 from PIL import Image
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from config import get_settings
+from .config import get_settings
 
 external_api_retry = retry(
     stop=stop_after_attempt(3),

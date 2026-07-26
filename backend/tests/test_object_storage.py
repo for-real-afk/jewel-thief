@@ -1,4 +1,4 @@
-import object_storage
+from app import object_storage
 
 
 def test_upload_catalog_image_puts_object_and_returns_public_url(mocker):

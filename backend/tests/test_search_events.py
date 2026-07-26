@@ -1,6 +1,6 @@
 import pytest
 
-import search_events
+from app import search_events
 
 
 class _FakeResult:

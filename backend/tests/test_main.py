@@ -3,8 +3,8 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-import cache
-import main
+from app import cache
+from app import main
 
 client = TestClient(main.app)
 

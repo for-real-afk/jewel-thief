@@ -54,12 +54,12 @@ import numpy as np
 from fastapi import UploadFile
 from PIL import Image, ImageDraw
 
-import embeddings
-import main
-import preprocessing
-import reranker
-import vector_db
-from config import get_settings
+from app import embeddings
+from app import main
+from app import preprocessing
+from app import reranker
+from app import vector_db
+from app.config import get_settings
 
 settings = get_settings()
 

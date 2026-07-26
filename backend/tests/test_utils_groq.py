@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import utils
+from app import utils
 
 
 def _fake_response(json_body, status_code=200):

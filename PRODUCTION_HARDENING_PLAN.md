@@ -52,14 +52,14 @@ not Celery, plain `logging` not structured JSON, no Sentry, no CI workflow file,
 
 | File | Action | Why |
 | --- | --- | --- |
-| `backend/main.py` | UPDATE | Job store swap, per-key auth, rate limiting, Celery dispatch, structured logging, deeper `/health` |
-| `backend/cache.py` | UPDATE | Add a `JobStore` ABC + `RedisJobStore`/`InMemoryJobStore` alongside the existing `SearchCache` (same file, same pattern — or a new `job_store.py` if you'd rather not overload `cache.py`; flagging as a decision, not deciding it here) |
-| `backend/config.py` | UPDATE | New settings: object storage creds, `api_keys` table toggle, rate-limit tiers, Sentry DSN, Celery broker URL |
-| `backend/catalog_store.py` | UPDATE | Add `image_url` write-through to object storage upload result |
-| NEW `backend/object_storage.py` | CREATE | Upload/URL-generation wrapper for the chosen provider (S3/R2 — decision needed, see Risks) |
-| NEW `backend/api_keys.py` | CREATE | Hash/lookup/issue/revoke logic for per-client keys |
-| NEW `backend/rate_limit.py` | CREATE | Redis token-bucket, tier-aware |
-| NEW `backend/tasks.py` | CREATE | Celery app + `index_catalog_item` task (body moved from `_index_job`) |
+| `backend/app/main.py` | UPDATE | Job store swap, per-key auth, rate limiting, Celery dispatch, structured logging, deeper `/health` |
+| `backend/app/cache.py` | UPDATE | Add a `JobStore` ABC + `RedisJobStore`/`InMemoryJobStore` alongside the existing `SearchCache` (same file, same pattern — or a new `job_store.py` if you'd rather not overload `cache.py`; flagging as a decision, not deciding it here) |
+| `backend/app/config.py` | UPDATE | New settings: object storage creds, `api_keys` table toggle, rate-limit tiers, Sentry DSN, Celery broker URL |
+| `backend/app/catalog_store.py` | UPDATE | Add `image_url` write-through to object storage upload result |
+| NEW `backend/app/object_storage.py` | CREATE | Upload/URL-generation wrapper for the chosen provider (S3/R2 — decision needed, see Risks) |
+| NEW `backend/app/api_keys.py` | CREATE | Hash/lookup/issue/revoke logic for per-client keys |
+| NEW `backend/app/rate_limit.py` | CREATE | Redis token-bucket, tier-aware |
+| NEW `backend/app/tasks.py` | CREATE | Celery app + `index_catalog_item` task (body moved from `_index_job`) |
 | NEW `backend/scripts/migrate_images_to_object_storage.py` | CREATE | `--dry-run` required, per existing script convention |
 | NEW `backend/scripts/create_api_key.py`, `revoke_api_key.py` | CREATE | CLI issuance/revocation |
 | `backend/Dockerfile`, `docker-compose.yml` (repo root) | UPDATE | Add Celery worker as a second process/service |
@@ -103,7 +103,7 @@ not Celery, plain `logging` not structured JSON, no Sentry, no CI workflow file,
     asserting 429 then recovery after the window.
 
 ### Phase 3 — Real job queue
-- Move `_index_job`'s body into a Celery task (`backend/tasks.py`), Redis as broker
+- Move `_index_job`'s body into a Celery task (`backend/app/tasks.py`), Redis as broker
   (same Redis instance as Phases 1/2 — one connection config, not two). Job status writes
   go to the Phase 1 `RedisJobStore` so `GET /api/v1/catalog/jobs/{job_id}` is unchanged
   from the caller's/frontend's perspective.

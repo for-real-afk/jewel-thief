@@ -22,10 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import embeddings
-import vector_db
-from main import build_catalog_text_description, infer_category
-from preprocessing import prepare_image_bytes, InvalidImageError
+from app import embeddings
+from app import vector_db
+from app.main import build_catalog_text_description, infer_category
+from app.preprocessing import prepare_image_bytes, InvalidImageError
 
 MANIFEST_DIR = Path(__file__).resolve().parent.parent / "sample_data" / "real_catalog"
 MANIFEST_PATH = MANIFEST_DIR / "metadata.json"

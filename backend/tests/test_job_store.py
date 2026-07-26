@@ -1,4 +1,4 @@
-import job_store
+from app import job_store
 
 
 def test_in_memory_job_store_set_then_get_returns_value():

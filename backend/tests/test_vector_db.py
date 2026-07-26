@@ -1,4 +1,4 @@
-import vector_db
+from app import vector_db
 
 
 def _fake_item(i):

@@ -3,7 +3,7 @@ import io
 import pytest
 from PIL import Image
 
-from preprocessing import InvalidImageError, load_and_validate, normalize, prepare_image_bytes
+from app.preprocessing import InvalidImageError, load_and_validate, normalize, prepare_image_bytes
 
 MAX_DIMENSION = 1024
 

@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 
 import redis
 
-from config import get_settings
+from .config import get_settings
 
 settings = get_settings()
 

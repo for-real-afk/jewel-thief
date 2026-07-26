@@ -17,14 +17,14 @@ venv/
 node_modules/
 dist/
 
-# backend/static/catalog/ and backend/catalog_store.json are INTENTIONALLY
+# backend/app/static/catalog/ and backend/catalog_store.json are INTENTIONALLY
 # tracked, not ignored — see the "Catalog images are committed" section in
 # README.md/DEPLOYMENT.md. Render's disk is ephemeral, so anything written
 # only at runtime vanishes on every restart; committing them bakes the
 # current catalog into the deploy itself instead of relying on local state.
 
 # Raw fetched source material for backend/scripts/fetch_sample_images.py —
-# regenerable, not needed at runtime (only backend/static/catalog/ is
+# regenerable, not needed at runtime (only backend/app/static/catalog/ is
 # actually served).
 backend/sample_data/
 

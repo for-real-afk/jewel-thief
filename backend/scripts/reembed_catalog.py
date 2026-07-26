@@ -32,12 +32,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import catalog_store
-import embeddings
-import vector_db
-from main import build_catalog_text_description
+from app import catalog_store
+from app import embeddings
+from app import vector_db
+from app.main import build_catalog_text_description
 
-STATIC_CATALOG_DIR = Path(__file__).resolve().parent.parent / "static" / "catalog"
+STATIC_CATALOG_DIR = Path(__file__).resolve().parent.parent / "app" / "static" / "catalog"
 PAGE_SIZE = 100
 PROGRESS_EVERY = 10
 

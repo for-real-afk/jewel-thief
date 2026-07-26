@@ -22,11 +22,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import catalog_store
-import object_storage
-import vector_db
+from app import catalog_store
+from app import object_storage
+from app import vector_db
 
-STATIC_CATALOG_DIR = Path(__file__).resolve().parent.parent / "static" / "catalog"
+STATIC_CATALOG_DIR = Path(__file__).resolve().parent.parent / "app" / "static" / "catalog"
 PAGE_SIZE = 100
 PROGRESS_EVERY = 10
 

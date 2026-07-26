@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import reranker
+from app import reranker
 
 IMAGE_QUERY = {"type": "image", "bytes": b"query-bytes"}
 

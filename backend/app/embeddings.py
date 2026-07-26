@@ -32,8 +32,8 @@ workaround relative to embedding pixels directly.
 from google import genai
 from google.genai import types
 
-from config import get_settings
-from utils import external_api_retry
+from .config import get_settings
+from .utils import external_api_retry
 
 settings = get_settings()
 _client = genai.Client(api_key=settings.gemini_api_key)

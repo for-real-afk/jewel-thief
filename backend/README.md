@@ -71,26 +71,28 @@ though the code itself is gone.
 
 ```text
 backend/
-  config.py         Settings — every env var, one place, loaded via python-dotenv
-  preprocessing.py   Image normalization (the "chunking" analog — see §4)
-  embeddings.py      Image -> vector via Gemini (gemini-embedding-2)
-  vector_db.py       Pinecone client: index creation, upsert, ANN search
-  reranker.py        LLM-judged reranking, provider-switched (Gemini / Groq)
-  utils.py           Shared retry decorator + Groq's OpenAI-compatible HTTP helper
-  catalog_store.py   Supabase-backed index of catalog items, for admin listing (§7)
-  job_store.py       Indexing job status -- Redis-backed when REDIS_URL is set (§7, §14)
-  api_keys.py        Per-client API key issuance/lookup/revocation, Supabase-backed (§14)
-  rate_limit.py       Redis-backed, tier-aware rate limiting per endpoint (§14)
-  logging_config.py  Structured (JSON) logging setup (§14)
-  object_storage.py  Cloudflare R2 (S3-compatible) catalog image storage (§14)
-  search_events.py   Search-event + feedback logging, Supabase-backed (§14)
-  main.py            FastAPI app: routes, request validation, job tracking, static files
-  static/catalog/    Persisted catalog photos, served at /static/catalog/{item_id}.jpg
+  app/
+    config.py         Settings — every env var, one place, loaded via python-dotenv
+    preprocessing.py   Image normalization (the "chunking" analog — see §4)
+    embeddings.py      Image -> vector via Gemini (gemini-embedding-2)
+    vector_db.py       Pinecone client: index creation, upsert, ANN search
+    reranker.py        LLM-judged reranking, provider-switched (Gemini / Groq)
+    utils.py           Shared retry decorator + Groq's OpenAI-compatible HTTP helper
+    catalog_store.py   Supabase-backed index of catalog items, for admin listing (§7)
+    job_store.py       Indexing job status -- Redis-backed when REDIS_URL is set (§7, §14)
+    api_keys.py        Per-client API key issuance/lookup/revocation, Supabase-backed (§14)
+    rate_limit.py       Redis-backed, tier-aware rate limiting per endpoint (§14)
+    logging_config.py  Structured (JSON) logging setup (§14)
+    object_storage.py  Cloudflare R2 (S3-compatible) catalog image storage (§14)
+    search_events.py   Search-event + feedback logging, Supabase-backed (§14)
+    main.py            FastAPI app: routes, request validation, job tracking, static files
+    static/catalog/    Persisted catalog photos, served at /static/catalog/{item_id}.jpg
   tests/             pytest suite — every external call mocked, no real API keys needed
   scripts/           One-off/utility scripts (see §9)
 frontend/
-  src/App.jsx          Chat search page ("/")
-  src/CatalogUpload.jsx  Catalog admin page ("/catalog")
+  src/pages/SearchPage.jsx      Chat search page ("/")
+  src/pages/CatalogPage.jsx     Catalog admin page ("/catalog")
+  src/components/ShimmerLine.jsx  Shared loading-state indicator (used by both pages)
   src/TopNav.jsx        Shared nav between the two routes
   src/theme.css        Shared design tokens (see note in §8)
   src/main.jsx         react-router-dom route table
@@ -480,7 +482,7 @@ Two pieces of state exist outside Pinecone:
 
 ### Catalog images are committed to the repo (historical; RESOLVED going forward, see §14)
 
-`backend/static/catalog/*.jpg` (the served images) is tracked in git, not ignored — a
+`backend/app/static/catalog/*.jpg` (the served images) is tracked in git, not ignored — a
 deliberate exception to "runtime state doesn't belong in the repo." This was forced by a
 real deployment problem: Render's disk is ephemeral (see `DEPLOYMENT.md` §1), so images
 written at indexing time vanished on every restart, breaking every thumbnail even though
@@ -501,10 +503,10 @@ to. `scripts/migrate_images_to_object_storage.py --dry-run` (then for real) back
 
 Two routes (`react-router-dom`), sharing one design system:
 
-- **`/`** (`App.jsx`) — the chat-style search page. Drag/drop or attach a photo, get
-  back ranked results as cards. Falls back to canned demo data if the backend is
-  unreachable, specifically so the UI is still inspectable/reviewable standalone.
-- **`/catalog`** (`CatalogUpload.jsx`) — the admin bulk-upload page. Drag/drop multiple
+- **`/`** (`pages/SearchPage.jsx`) — the chat-style search page. Drag/drop or attach a
+  photo, get back ranked results as cards. Falls back to canned demo data if the backend
+  is unreachable, specifically so the UI is still inspectable/reviewable standalone.
+- **`/catalog`** (`pages/CatalogPage.jsx`) — the admin bulk-upload page. Drag/drop multiple
   images, fill in an editable row per image (name/category/price required; caption/
   description/tags/material optional), submit, and watch a real job-status poll to
   completion. **Deliberately has no demo fallback** — silently showing fake "success" on
@@ -515,7 +517,7 @@ Two routes (`react-router-dom`), sharing one design system:
 `:root` CSS variables, fonts, `.app-shell`, `.header`, `.wordmark`, `.shimmer-line`.
 This is not a stylistic choice, it's a correctness requirement: React's inline
 `<style>` tags aren't scoped, but since only one route's component tree is ever mounted
-at a time, a page-specific `<style>` block (like `App.jsx`'s) simply doesn't exist in
+at a time, a page-specific `<style>` block (like `pages/SearchPage.jsx`'s) simply doesn't exist in
 the DOM when a *different* route is active. Anything both pages need has to live
 somewhere that's always mounted — see
 [ISSUES.md §6.3](../ISSUES.md#63-the-new-admin-page-would-have-rendered-completely-unstyled)
@@ -534,7 +536,7 @@ unsubmitted rows; accepted as a v1 tradeoff.
 cp .env.example .env   # fill in real GEMINI_API_KEY, PINECONE_API_KEY, APP_API_KEY,
                         # and GROQ_API_KEY if LLM_PROVIDER=groq
 pip install -r requirements.txt
-uvicorn main:app --reload
+uvicorn app.main:app --reload
 ```
 
 Also run `backend/scripts/sql/001_api_keys_search_events_feedback.sql` once in the

@@ -1,7 +1,7 @@
 import json
 import logging
 
-import logging_config
+from app import logging_config
 
 
 def _make_record(structured_fields=None, exc_info=None):
