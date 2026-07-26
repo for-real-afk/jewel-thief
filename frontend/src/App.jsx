@@ -20,25 +20,6 @@ function loadStoredMessages() {
   }
 }
 
-// Archives the user's query image to object storage (S3) via a backend-issued
-// pre-signed URL, so the browser never holds AWS credentials directly.
-async function uploadQueryImage(file) {
-  const presignRes = await fetch(`${API_BASE}/api/v1/uploads/presign`, {
-    method: "POST",
-    headers: { "x-api-key": API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: file.name, content_type: file.type }),
-  });
-  if (!presignRes.ok) throw new Error("presign request failed");
-  const { upload_url } = await presignRes.json();
-
-  const putRes = await fetch(upload_url, {
-    method: "PUT",
-    headers: { "Content-Type": file.type },
-    body: file,
-  });
-  if (!putRes.ok) throw new Error("upload to storage failed");
-}
-
 // Object URLs (URL.createObjectURL) only live as long as the page does, so a
 // chat bubble holding one can't survive a reload. Converting to a base64
 // data URL trades a larger sessionStorage footprint for a self-contained
@@ -92,14 +73,6 @@ const DESCRIPTION_PREVIEW_LENGTH = 90;
 function truncateText(text, maxLength) {
   if (!text || text.length <= maxLength) return { short: text, isTruncated: false };
   return { short: text.slice(0, maxLength).trimEnd(), isTruncated: true };
-}
-
-function CloudIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <path d="M6.5 18a4 4 0 0 1-.5-7.97A5.5 5.5 0 0 1 17 8.06 4.5 4.5 0 0 1 16.5 17H6.5Z" strokeLinejoin="round" />
-    </svg>
-  );
 }
 
 function ResultCard({ match, onOpenDetail }) {
@@ -273,7 +246,7 @@ export default function App() {
     setMessages((m) => [
       ...m,
       image
-        ? { id: msgId, role: "user", type: "image", imageUrl: image.url, caption: text || "", archiveStatus: "saving" }
+        ? { id: msgId, role: "user", type: "image", imageUrl: image.url, caption: text || "" }
         : { role: "user", type: "text", text },
     ]);
     setIsSearching(true);
@@ -281,17 +254,8 @@ export default function App() {
     if (image) setPendingImage(null);
 
     if (image) {
-      uploadQueryImage(image.file)
-        .then(() => {
-          setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "saved" } : msg)));
-        })
-        .catch(() => {
-          setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, archiveStatus: "error" } : msg)));
-        });
-
       // Swap the (page-lifetime-only) object URL for a durable data URL so
-      // this bubble's photo survives a refresh — independent of whether the
-      // S3 archive above succeeds.
+      // this bubble's photo survives a refresh.
       fileToDataUrl(image.file)
         .then((dataUrl) => {
           setMessages((m) => m.map((msg) => (msg.id === msgId ? { ...msg, imageUrl: dataUrl } : msg)));
@@ -404,24 +368,6 @@ export default function App() {
           color: var(--ink-soft);
           margin-top: 6px;
           text-align: right;
-        }
-
-        .archive-badge {
-          display: flex;
-          align-items: center;
-          justify-content: flex-end;
-          gap: 5px;
-          margin: 6px 0 0;
-          font-size: 11px;
-          color: var(--ink-soft);
-        }
-        .archive-badge.saving { opacity: 0.6; }
-        .archive-badge.saving svg { animation: archive-pulse 1.1s ease-in-out infinite; }
-        .archive-badge.saved { color: var(--gold-1); }
-        .archive-badge.error { color: #B3492F; }
-        @keyframes archive-pulse {
-          0%, 100% { opacity: 0.4; }
-          50% { opacity: 1; }
         }
 
         .results-row {
@@ -761,16 +707,6 @@ export default function App() {
                   <div className="user-image-placeholder">Photo you uploaded (not kept after refresh)</div>
                 )}
                 {m.caption && <p className="user-image-caption">{m.caption}</p>}
-                {m.archiveStatus && (
-                  <p className={`archive-badge ${m.archiveStatus}`}>
-                    <CloudIcon />
-                    {m.archiveStatus === "saving"
-                      ? "Saving to storage…"
-                      : m.archiveStatus === "error"
-                      ? "Couldn't save to storage"
-                      : "Saved to storage"}
-                  </p>
-                )}
               </div>
             )}
             {m.type === "results" && (
