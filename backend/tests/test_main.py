@@ -655,7 +655,7 @@ def test_update_catalog_item_metadata_only_skips_reembedding_and_reuses_existing
     )
     mock_update_metadata = mocker.patch.object(main.vector_db, "update_metadata")
     mock_upsert = mocker.patch.object(main.vector_db, "upsert_batch")
-    mock_embed = mocker.patch.object(main.embeddings, "embed_catalog_image")
+    mock_embed = mocker.patch.object(main.embeddings, "embed_catalog_item")
     mock_record = mocker.patch.object(main.catalog_store, "record_item")
 
     resp = client.patch(
@@ -686,7 +686,7 @@ def test_update_catalog_item_with_new_image_reembeds_and_overwrites_file(mocker,
             "name": "Ring", "category": "ring", "price": 100.0,
         },
     )
-    mocker.patch.object(main.embeddings, "embed_catalog_image", return_value=[0.2] * 8)
+    mocker.patch.object(main.embeddings, "embed_catalog_item", return_value=[0.2] * 8)
     mock_upsert = mocker.patch.object(main.vector_db, "upsert_batch")
     mock_update_metadata = mocker.patch.object(main.vector_db, "update_metadata")
     mocker.patch.object(main.catalog_store, "record_item")

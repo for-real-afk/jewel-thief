@@ -515,7 +515,10 @@ async def update_catalog_item(
         except InvalidImageError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-        vector = embeddings.embed_catalog_image(clean_bytes)
+        text_description = build_catalog_text_description(
+            edited.name, edited.caption, edited.description, edited.tags
+        )
+        vector = embeddings.embed_catalog_item(clean_bytes, text_description)
         image_path = CATALOG_IMAGE_DIR / f"{item_id}.jpg"
         image_path.write_bytes(clean_bytes)
         metadata["filename"] = image.filename
