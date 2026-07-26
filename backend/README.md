@@ -537,6 +537,13 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
+Also run `backend/scripts/sql/001_api_keys_search_events_feedback.sql` once in the
+Supabase SQL editor -- `api_keys.py` and `search_events.py` read/write those three
+tables but nothing creates them automatically (unlike `catalog_items`, which predates
+this). Skipping it means `POST /api/v1/search` silently fails to log to `search_events`
+(caught, logged, doesn't break the search response) and any real per-client API key
+issued via `create_api_key.py` won't validate.
+
 API docs at `http://localhost:8000/docs` once running.
 
 ```bash
