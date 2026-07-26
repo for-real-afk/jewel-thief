@@ -314,6 +314,75 @@ the session.
 
 ---
 
+## 7. Production hardening & the `backend/app/` restructure
+
+### 7.1 An unconfigured object-storage client crashed the entire app on startup, not just image uploads
+**What:** After shipping `object_storage.py` (Cloudflare R2 image storage), the live
+Render service crash-looped: `ValueError: Invalid endpoint:
+https://.r2.cloudflarestorage.com`, `==> Exited with status 1`. Every endpoint was
+down, not just image uploads — the crash happened before the FastAPI app object even
+finished constructing.
+**Why:** `object_storage.py` built its boto3 `s3` client as a *module-level* statement,
+executed immediately when `main.py`'s unconditional `import object_storage` ran at
+process startup. `R2_ACCOUNT_ID` had never been added to `render.yaml`/Render's
+dashboard for this newly-shipped feature, so it defaulted to `""`, producing the
+literally-invalid endpoint `https://.r2.cloudflarestorage.com` — and boto3 validates the
+endpoint URL eagerly at client-construction time, not on first real request.
+**Fix:** Moved client construction into a `_get_client()` function, called lazily on
+first actual upload/delete, with a clear `RuntimeError` naming the missing env vars if
+still unconfigured — instead of at import time. Search and every other endpoint now work
+regardless of R2's configuration state; only the catalog-image path is affected by a
+missing R2 setup, and it now fails with an intelligible error instead of taking the
+whole process down.
+
+### 7.2 Shipped code referenced three Supabase tables that no migration ever created
+**What:** Every real search request logged a caught (non-fatal) error and fired a Sentry
+event: `postgrest.exceptions.APIError: {'message': "Could not find the table
+'public.search_events' in the schema cache", 'code': 'PGRST205', ...}`.
+**Why:** `search_events.py` and `api_keys.py` were both written against Supabase tables
+(`search_events`, `search_feedback`, `api_keys`) that were never actually created by any
+script or documented SQL — unlike `catalog_items`, which had a real one-off migration.
+`api_keys`'s version of this gap hadn't surfaced yet only because `require_api_key()`'s
+legacy `APP_API_KEY` fallback short-circuits before ever querying that table.
+**Fix:** Wrote `backend/scripts/sql/001_api_keys_search_events_feedback.sql` (idempotent
+`CREATE TABLE IF NOT EXISTS`, matching the exact columns each module already
+reads/writes) for a human to run once in Supabase's SQL editor — no migration runner
+exists in this repo, and this agent has no Supabase credentials to apply it directly.
+**Not yet resolved** — the SQL has been provided but not yet run as of this entry.
+
+### 7.3 A test-suite import sweep missed function-local imports during the restructure
+**What:** After moving all 15 backend modules into `backend/app/` and converting every
+module-level `import X` to `from app import X` across `tests/`/`scripts/`, one test still
+failed: `test_cache.py::test_search_cache_hit_skips_embed_text_query` —
+`ModuleNotFoundError: No module named 'embeddings'`.
+**Why:** The grep sweep used to find stale imports was anchored to line-start
+(`^import X$`), which correctly caught every module-level import but missed three
+imports written *inside* a test function's body (indented `import embeddings` / `import
+main` / `import vector_db`) — a pattern used nowhere else in the suite.
+**Fix:** Re-ran the sweep with an indentation-tolerant pattern (`^\s+import X$`) across
+`tests/`, `scripts/`, and `app/`, confirmed no further hits, and re-ran the full suite
+back to 185/185 passing — the same count as the pre-restructure baseline.
+
+### 7.4 The restructure had two silent-breakage risks, both caught before any deploy
+**What:** Neither of these was ever observed failing in production — both were caught
+while planning the restructure, specifically because of the precedent set by 7.1's
+crash-loop.
+**Why:** (a) `render.yaml`'s `startCommand` and `Dockerfile`'s `CMD` both hardcoded
+`uvicorn main:app`; moving `main.py` to `backend/app/main.py` without updating either
+would have caused the exact same crash-loop as 7.1 on the next deploy. (b) `main.py`'s
+`STATIC_DIR = Path(__file__).resolve().parent / "static"` is relative to wherever
+`main.py` itself lives — moving `main.py` into `app/` without also moving `static/` would
+have silently pointed this at a *new, empty* `backend/app/static/` directory
+(auto-created by the next line's `mkdir(parents=True, exist_ok=True)`, no error raised),
+quietly serving broken images instead of failing loudly.
+**Fix:** (a) Updated both `render.yaml` and `Dockerfile` to `uvicorn app.main:app` in the
+same change that moved `main.py`. (b) Moved `static/` into `backend/app/static/`
+alongside `main.py`, keeping the existing relative-path code unchanged, then verified
+with a real running server that `/static/catalog/ring-10.jpg` returned `200` — not just
+that `mkdir` hadn't errored.
+
+---
+
 ## Recurring themes worth naming directly
 
 - **Verify, don't assume, for anything crossing a process/network boundary.** Nearly
@@ -328,3 +397,7 @@ the session.
   Both 4.1 (embedding provider switch) and 5.1 (missing `image_url` backfill) are
   instances of the same underlying discipline: know whether an operation is a full
   replace or a partial merge before touching data that's already live.
+- **A module-level side effect at import time can crash the whole app, not just the
+  feature it belongs to.** 7.1's R2 client (and any future external-service client)
+  should be constructed lazily, on first real use — not eagerly at import — so one
+  misconfigured integration can't take down request paths that never touch it.
