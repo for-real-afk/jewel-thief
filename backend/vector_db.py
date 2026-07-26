@@ -10,6 +10,14 @@ settings = get_settings()
 _pc = Pinecone(api_key=settings.pinecone_api_key)
 
 
+def ping() -> None:
+    """Cheap, read-only Pinecone reachability check for GET /health --
+    list_indexes(), not get_or_create_index() (which can have the side
+    effect of creating an index on a misconfigured name). Raises on
+    failure; callers decide how to report that."""
+    _pc.list_indexes()
+
+
 def get_or_create_index():
     existing = [idx["name"] for idx in _pc.list_indexes()]
     if settings.pinecone_index_name not in existing:

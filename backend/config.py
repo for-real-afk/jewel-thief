@@ -61,6 +61,21 @@ class Settings(BaseModel):
     # -- API auth --
     api_key: str = os.getenv("APP_API_KEY", "change-me-in-production")
 
+    # -- Object storage (Cloudflare R2, S3-compatible -- catalog item images) --
+    # Render's disk is ephemeral (DEPLOYMENT.md §1): without this, any image
+    # added via the live /catalog admin page is lost on the next restart.
+    r2_account_id: str = os.getenv("R2_ACCOUNT_ID", "")
+    r2_access_key_id: str = os.getenv("R2_ACCESS_KEY_ID", "")
+    r2_secret_access_key: str = os.getenv("R2_SECRET_ACCESS_KEY", "")
+    r2_bucket_name: str = os.getenv("R2_BUCKET_NAME", "jewel-thief-catalog")
+    # Public bucket URL or custom domain, no trailing slash (e.g.
+    # https://pub-xxxx.r2.dev or https://images.example.com).
+    r2_public_url_base: str = os.getenv("R2_PUBLIC_URL_BASE", "")
+
+    # -- Error tracking (Sentry) --
+    # Empty = disabled (main.py only calls sentry_sdk.init() when this is set).
+    sentry_dsn: str = os.getenv("SENTRY_DSN", "")
+
     # -- Caching (see cache.py) --
     # Empty string = use InMemoryCache (single-instance stopgap). Set once
     # Redis is available in deployment -- cache.py's RedisCache (drop-in,

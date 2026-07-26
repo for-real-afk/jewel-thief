@@ -77,7 +77,13 @@ backend/
   vector_db.py       Pinecone client: index creation, upsert, ANN search
   reranker.py        LLM-judged reranking, provider-switched (Gemini / Groq)
   utils.py           Shared retry decorator + Groq's OpenAI-compatible HTTP helper
-  catalog_store.py   Local JSON-backed index of catalog items, for admin listing
+  catalog_store.py   Supabase-backed index of catalog items, for admin listing (§7)
+  job_store.py       Indexing job status -- Redis-backed when REDIS_URL is set (§7, §14)
+  api_keys.py        Per-client API key issuance/lookup/revocation, Supabase-backed (§14)
+  rate_limit.py       Redis-backed, tier-aware rate limiting per endpoint (§14)
+  logging_config.py  Structured (JSON) logging setup (§14)
+  object_storage.py  Cloudflare R2 (S3-compatible) catalog image storage (§14)
+  search_events.py   Search-event + feedback logging, Supabase-backed (§14)
   main.py            FastAPI app: routes, request validation, job tracking, static files
   static/catalog/    Persisted catalog photos, served at /static/catalog/{item_id}.jpg
   tests/             pytest suite — every external call mocked, no real API keys needed
@@ -450,15 +456,17 @@ represents, so every existing vector was regenerated via `scripts/reembed_catalo
 
 Two pieces of state exist outside Pinecone:
 
-- **`_jobs`** (a plain dict in `main.py`, **in-process and single-instance**):
-  `job_id -> {status, total, processed, failed_items}`. Written to by `_index_job` as it
-  processes each item; read by `GET /api/v1/catalog/jobs/{job_id}`. `status` is
-  `"pending"` while running, `"done"` once every item has been *attempted* (even if some
-  failed — partial success still counts as done), `"failed"` only if *every single item*
-  failed. This is explicitly a v1 tradeoff, not a production design: it disappears on
-  restart and isn't shared across multiple backend processes — move to Redis (or a real
-  queue) before running more than one backend instance, or a second instance (or a
-  restart) simply won't see jobs another instance recorded.
+- **Job status** (`job_store.py`, **RESOLVED** — see §14): `job_id -> {status, total,
+  processed, failed_items}`. Written to by `_index_job` as it processes each item; read
+  by `GET /api/v1/catalog/jobs/{job_id}`. `status` is `"pending"` while running, `"done"`
+  once every item has been *attempted* (even if some failed — partial success still
+  counts as done), `"failed"` only if *every single item* failed. Previously a plain dict
+  in `main.py` (in-process, single-instance); now behind the same storage-swap-via-
+  interface pattern as `cache.py` — `InMemoryJobStore` (single-instance, `REDIS_URL`
+  unset) or `RedisJobStore` (shared across instances, `REDIS_URL` set). The underlying
+  job-processing loop still runs in a `BackgroundTask` in whichever process started it —
+  a real queue (Celery) that lets a *different* instance resume a killed job is still
+  outstanding, see `PRODUCTION_HARDENING_PLAN.md` Phase 3.
 - **`catalog_store.py`**: item metadata (`item_id -> metadata`) mirrored into a Supabase
   `catalog_items` table alongside every Pinecone upsert (`record_item`), read back
   paginated for `GET /api/v1/catalog/items` (`list_items`) and by
@@ -470,7 +478,7 @@ Two pieces of state exist outside Pinecone:
   `backend/catalog_store.json` still exists in the repo as the one-time migration
   source for `scripts/migrate_catalog_to_supabase.py`, not as a live data path anymore.
 
-### Catalog images are committed to the repo
+### Catalog images are committed to the repo (historical; RESOLVED going forward, see §14)
 
 `backend/static/catalog/*.jpg` (the served images) is tracked in git, not ignored — a
 deliberate exception to "runtime state doesn't belong in the repo." This was forced by a
@@ -480,10 +488,12 @@ search itself kept working (the Pinecone vectors + `image_url` metadata are unaf
 by a restart — only the actual image files were gone). Committing the current set means
 it ships with every deploy regardless of restarts.
 
-This only covers whatever was committed. Any item added through the live `/catalog`
-admin page afterward is still written only to the running container's disk and is
-exactly as ephemeral as before — see `DEPLOYMENT.md` §5 for the actual permanent fix
-(object storage) versus this stopgap.
+This only covers whatever was committed as of when this stopgap was in effect. **As of
+§14, new/updated catalog images upload straight to Cloudflare R2** (`object_storage.py`)
+instead of local disk — the actual permanent fix `DEPLOYMENT.md` §5 previously pointed
+to. `scripts/migrate_images_to_object_storage.py --dry-run` (then for real) backfills
+`image_url` for every item indexed before this cutover, using the still-committed
+`static/catalog/*.jpg` files as its source.
 
 ---
 
@@ -547,6 +557,8 @@ npm run dev   # http://localhost:5173
 | `GROQ_CHAT_TIMEOUT_SECONDS` | Must be generous enough for a full `TOP_K`-candidate batch in one prompt, not just a single small request (see §6) — Groq's cloud inference needs far less headroom here than the local model that used to fill this role did |
 | `GROQ_MODEL` | Whatever vision-capable model is available on the account; verify via `GET /v1/models`, don't assume a name |
 | `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | Catalog metadata table (§7) — required, no fallback |
+| `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET_NAME` / `R2_PUBLIC_URL_BASE` | Cloudflare R2 object storage for catalog images (§14) — required, no fallback (a boto3 client is built at import time and fails fast on a missing account ID) |
+| `SENTRY_DSN` | Empty = Sentry disabled. Set to enable error tracking (§14) |
 
 ### Scripts (`scripts/`)
 
@@ -577,9 +589,17 @@ python scripts/smoke_test.py
 
 ## 11. Known limitations / production considerations
 
-- `_jobs` (indexing progress) is in-memory/single-instance — move to Redis/a real queue
-  before running more than one backend instance (§7). The catalog store itself no
-  longer has this limitation (Supabase, §7).
+- ~~`_jobs` (indexing progress) is in-memory/single-instance~~ — **RESOLVED**, see §7/§14
+  (`job_store.py`, Redis-backed when configured). The `BackgroundTask` itself still runs
+  in a single process; a real queue (Celery, so a *different* instance can resume a
+  killed job) is still outstanding — `PRODUCTION_HARDENING_PLAN.md` Phase 3.
+- ~~A single shared `APP_API_KEY` for all clients, no rate limiting~~ — **RESOLVED**, see
+  §14 (`api_keys.py`, `rate_limit.py`). `APP_API_KEY` is still accepted as a "legacy"
+  client during rollout — retire it once every real client has a per-client key.
+- Object storage for catalog images, a real task queue (Celery), Sentry error tracking, a
+  metrics dashboard, CI/CD + staging, and search-event data collection are still
+  outstanding — see `PRODUCTION_HARDENING_PLAN.md` for the full phased plan and
+  sequencing rationale.
 - ~~The reranker's confidence-tier-first sort can let a wrong LLM judgment override a
   correct cosine-similarity signal~~ — **RESOLVED.** `final_rank_score()` replaced the
   confidence-tier-first sort with a bounded additive weight; see §6, point 3.
@@ -709,3 +729,68 @@ this session. Before trusting this gate for a real product surface, measure its
 false-negative rate on real (including unusual/abstract) jewellery photos — a gate that
 silently rejects legitimate customer uploads is a worse user experience than the puppy
 photo problem it's meant to solve.
+
+---
+
+## 14. Production infrastructure hardening
+
+Implemented against the phased plan in `PRODUCTION_HARDENING_PLAN.md`: Phase 1 (all of
+it, including 1.3), Phase 2, Phase 4.1/4.2/4.4, Phase 5's CI half, and Phase 6. See that
+document for what's still outstanding (Celery/a real job queue, a metrics dashboard, and
+a staging environment) and why those specifically are deferred until real usage justifies
+their cost.
+
+- **`object_storage.py`** — catalog images upload to Cloudflare R2 instead of the
+  container's local disk. This fixed a **live data-loss bug**, not a scaling nice-to-have:
+  Render's disk is ephemeral (DEPLOYMENT.md §1), so any image added/replaced through the
+  live `/catalog` admin page was lost on the next restart/redeploy. `scripts/
+  migrate_images_to_object_storage.py --dry-run` (then for real) backfills `image_url`
+  for items indexed before this cutover, from the still-git-committed `static/catalog/`
+  images. Resolves the object-storage limitation noted in §7/`DEPLOYMENT.md` §5.
+- **Sentry** (`SENTRY_DSN`) — uncaught exceptions in `unhandled_exception_handler` and
+  per-item indexing failures in `_index_job` now report to Sentry (`sentry_sdk.
+  capture_exception`), not just a log line. No-op when `SENTRY_DSN` is unset (local dev).
+- **`job_store.py`** — job-status tracking (`_jobs`, formerly a plain dict in `main.py`)
+  moved behind the same storage-swap-via-interface pattern as `cache.py`:
+  `InMemoryJobStore` (single-instance, `REDIS_URL` unset) or `RedisJobStore` (shared
+  across instances, 24h TTL, `REDIS_URL` set). Resolves the `_jobs` limitation in §7/§11.
+- **`api_keys.py`** — per-client API keys, hashed (SHA-256) in a new Supabase `api_keys`
+  table (`key_id`, `hashed_key`, `client_name`, `rate_limit_tier`, `revoked_at`). Issue
+  with `scripts/create_api_key.py --client-name <name> [--tier <tier>]` (prints the raw
+  key once); revoke with `scripts/revoke_api_key.py --key-id <uuid>`. The legacy shared
+  `APP_API_KEY` is still accepted, mapped to client_name `"legacy"`, as a deprecation
+  path. **Retirement date: 2026-10-27** — by then, every real client should have a
+  per-client key; remove the legacy branch in `require_api_key` (`main.py`) and drop
+  `APP_API_KEY` from `.env.example`/`render.yaml`. Resolves the single-shared-key
+  limitation in §11.
+- **`search_events.py`** (Phase 6) — one row per search written to Supabase
+  `search_events` (query type, candidates retrieved, path taken, results returned,
+  no_match), plus `POST /api/v1/search/{query_id}/feedback` writing to
+  `search_feedback`. Best-effort at the call site in `main.py`'s `search()` — a Supabase
+  hiccup here is logged and reported to Sentry but never breaks the actual search
+  response. No training pipeline consumes this data yet; it exists so real search
+  behavior isn't lost before there's something to train on it.
+- **CI** — `.github/workflows/ci.yml` runs the full `pytest` suite and
+  `scripts/smoke_test.py` on every PR touching `backend/**`, blocking merge on failure.
+  No deploy step: Render's own GitHub integration handles deploys from `main`. A
+  separate staging environment (its own Pinecone index, Supabase project, Redis
+  instance) is deliberately deferred — see `PRODUCTION_HARDENING_PLAN.md` Phase 5.
+- **`rate_limit.py`** — Redis-backed, tier-aware rate limiting, applied separately to
+  `/api/v1/search` and `/api/v1/catalog/index` (bulk indexing gets a much lower budget
+  than search). Implemented as a fixed-window counter rather than a literal token bucket
+  — same practical effect, simpler to reason about and test. No-op when `REDIS_URL` isn't
+  set, same tradeoff as `cache.py`/`job_store.py`'s in-memory fallbacks. Returns `429`
+  with a `Retry-After` header on limit, not a bare `500`.
+- **`GET /health`** — now actually checks Pinecone (`vector_db.ping()`), Supabase
+  (`catalog_store.ping()`), and Redis (`cache.ping()`, only when `REDIS_URL` is set)
+  reachability, returning `{"status": "ok"|"degraded", "checks": {...}}` with a `503` on
+  any failure, instead of a static `{"status": "ok"}`.
+- **`logging_config.py`** — structured (JSON) logging, installed at `main.py` import
+  time. Existing `logger.info`/`logger.exception` call sites are unchanged; pass
+  `extra={"structured_fields": {...}}` to attach queryable fields to a log line. The
+  `/api/v1/search` endpoint logs one `"search request completed"` line per request with
+  `request_id`, `client_name`, `query_type`, `cache_hit` (text queries only),
+  `path_taken`, `result_count`, `no_match`, and total `latency_ms`. Per-stage latency
+  (embed / vector search / rerank individually) was scoped out of this pass — it would
+  require threading timers through `embeddings.py`/`vector_db.py`/`reranker.py`; the
+  request-level total is what shipped here.

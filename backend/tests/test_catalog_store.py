@@ -44,6 +44,10 @@ class _FakeTable:
         self._range = (start, end)
         return self
 
+    def limit(self, n):
+        self._range = (0, n - 1)
+        return self
+
     def execute(self):
         if self._op == "upsert":
             self._store[self._row["item_id"]] = self._row
@@ -76,6 +80,19 @@ class _FakeClient:
 @pytest.fixture(autouse=True)
 def fake_supabase(mocker):
     mocker.patch.object(catalog_store, "_client", _FakeClient())
+
+
+def test_ping_does_not_raise_when_supabase_reachable():
+    catalog_store.ping()  # fake client always succeeds -- should not raise
+
+
+def test_ping_propagates_failure(mocker):
+    mocker.patch.object(catalog_store, "_client", mocker.Mock(**{
+        "table.return_value.select.return_value.limit.return_value.execute.side_effect": Exception("down"),
+    }))
+
+    with pytest.raises(Exception, match="down"):
+        catalog_store.ping()
 
 
 def test_record_and_list_round_trip():

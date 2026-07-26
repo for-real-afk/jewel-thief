@@ -30,6 +30,15 @@ os.environ.setdefault("APP_API_KEY", "test-api-key")
 os.environ.setdefault("ALLOWED_ORIGINS", "http://localhost:5173")
 os.environ.setdefault("SUPABASE_URL", "https://fake-project.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "fake-supabase-service-key")
+# object_storage.py builds a boto3 client at import time, which validates its
+# endpoint URL immediately (unlike Pinecone/Supabase's lazier clients) -- an
+# empty R2_ACCOUNT_ID produces an invalid "https://.r2.cloudflarestorage.com"
+# endpoint and fails collection entirely, so this needs a real-shaped fake.
+os.environ.setdefault("R2_ACCOUNT_ID", "fake-account-id")
+os.environ.setdefault("R2_ACCESS_KEY_ID", "fake-access-key-id")
+os.environ.setdefault("R2_SECRET_ACCESS_KEY", "fake-secret-access-key")
+os.environ.setdefault("R2_BUCKET_NAME", "test-jewellery-catalog")
+os.environ.setdefault("R2_PUBLIC_URL_BASE", "https://pub-fake.r2.dev")
 
 import pytest
 from PIL import Image

@@ -15,6 +15,12 @@ _client = create_client(settings.supabase_url, settings.supabase_key)
 _TABLE = "catalog_items"
 
 
+def ping() -> None:
+    """Cheap, read-only Supabase reachability check for GET /health. Raises
+    on failure; callers decide how to report that."""
+    _client.table(_TABLE).select("item_id").limit(1).execute()
+
+
 def record_item(item_id: str, metadata: dict) -> None:
     """Upsert one item's metadata into the catalog table (mirrors the Pinecone upsert)."""
     _client.table(_TABLE).upsert({"item_id": item_id, "metadata": metadata}).execute()

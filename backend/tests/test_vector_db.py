@@ -5,6 +5,23 @@ def _fake_item(i):
     return {"id": f"item-{i}", "vector": [0.1] * 8, "metadata": {"category": "ring"}}
 
 
+def test_ping_calls_list_indexes(mocker):
+    mock_list = mocker.patch.object(vector_db._pc, "list_indexes", return_value=[])
+
+    vector_db.ping()
+
+    mock_list.assert_called_once()
+
+
+def test_ping_propagates_failure(mocker):
+    import pytest
+
+    mocker.patch.object(vector_db._pc, "list_indexes", side_effect=Exception("unreachable"))
+
+    with pytest.raises(Exception, match="unreachable"):
+        vector_db.ping()
+
+
 def test_get_or_create_index_creates_when_missing(mocker):
     mocker.patch.object(vector_db._pc, "list_indexes", return_value=[{"name": "some-other-index"}])
     mock_create = mocker.patch.object(vector_db._pc, "create_index")

@@ -11,29 +11,46 @@ Endpoints:
   DELETE /api/v1/catalog/items/{item_id}   — remove an item from the catalog
   GET    /health                           — healthcheck
 """
+import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Literal, Optional
 
+import sentry_sdk
 from fastapi import FastAPI, File, UploadFile, Form, Header, HTTPException, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, ValidationError
 
+import api_keys
 import cache
 import catalog_store
 import embeddings
+import job_store
+import logging_config
+import object_storage
+import rate_limit
+import search_events
 import vector_db
 import reranker
 from config import get_settings
 from preprocessing import prepare_image_bytes, InvalidImageError
 
 settings = get_settings()
+logging_config.configure_logging()
 logger = logging.getLogger("jewellery_search")
+
+# No-op (sentry_sdk.init is never called) when SENTRY_DSN is unset -- capture
+# calls below become harmless no-ops too (sentry_sdk's documented behavior
+# when the SDK isn't initialized), so this is safe to leave in for local dev.
+if settings.sentry_dsn:
+    sentry_sdk.init(dsn=settings.sentry_dsn, traces_sample_rate=0.0)
+
 app = FastAPI(title="Jewellery Visual Search API", version="1.0.0")
 
 app.add_middleware(
@@ -56,6 +73,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
     Catching it here keeps the response inside the normal middleware chain,
     so CORSMiddleware still gets to attach its headers."""
     logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    sentry_sdk.capture_exception(exc)
     return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 # Search results need something to actually show the user — catalog images
@@ -68,9 +86,36 @@ CATALOG_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-def require_api_key(x_api_key: Optional[str] = Header(None)):
-    if x_api_key != settings.api_key:
+def require_api_key(x_api_key: Optional[str] = Header(None)) -> tuple[str, str]:
+    """Validates the incoming key and returns (client_name, rate_limit_tier)
+    -- used by rate_limit.py's per-tier checks and, later, structured
+    logging. The legacy shared APP_API_KEY is still accepted, mapped to
+    ("legacy", "legacy"), as a deprecation path during rollout of per-client
+    keys (api_keys.py).
+
+    RETIREMENT DATE: 2026-10-27 (90 days from this fallback shipping). Once
+    every real client has been issued a per-client key via
+    scripts/create_api_key.py, remove the `x_api_key == settings.api_key`
+    branch below and drop APP_API_KEY from .env.example/render.yaml. See
+    README.md §14 and PRODUCTION_HARDENING_PLAN.md's Risks table -- this is
+    a dated commitment, not an "eventually"."""
+    if x_api_key == settings.api_key:
+        return "legacy", "legacy"
+    key_record = x_api_key and api_keys.lookup_key(x_api_key)
+    if key_record is None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    return key_record["client_name"], key_record["rate_limit_tier"]
+
+
+def _enforce_rate_limit(scope: str, client_name: str, tier: str) -> None:
+    try:
+        rate_limit.check(scope, client_name, tier)
+    except rate_limit.RateLimitExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Try again later.",
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        )
 
 
 class MatchResult(BaseModel):
@@ -87,6 +132,11 @@ class SearchResponse(BaseModel):
     no_match: bool
     query_type: Literal["image", "text"]
     reason: Optional[str] = None
+
+
+class FeedbackRequest(BaseModel):
+    result_id: str = Field(min_length=1)
+    action: Literal["clicked", "purchased", "dismissed"]
 
 
 class IndexResponse(BaseModel):
@@ -158,7 +208,45 @@ def infer_category(caption: str) -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Actually verifies Pinecone, Supabase, and (if configured) Redis are
+    reachable, rather than a static {"status": "ok"} -- this is what a real
+    uptime monitor should hit. Redis is reported "not_configured" rather
+    than "down" when REDIS_URL is unset, since that's a deliberate dev/
+    single-instance choice (see cache.py/job_store.py), not a failure."""
+    checks = {}
+    healthy = True
+
+    try:
+        vector_db.ping()
+        checks["pinecone"] = "ok"
+    except Exception:
+        logger.exception("Health check: Pinecone unreachable.")
+        checks["pinecone"] = "unreachable"
+        healthy = False
+
+    try:
+        catalog_store.ping()
+        checks["supabase"] = "ok"
+    except Exception:
+        logger.exception("Health check: Supabase unreachable.")
+        checks["supabase"] = "unreachable"
+        healthy = False
+
+    if settings.redis_url:
+        try:
+            cache.ping()
+            checks["redis"] = "ok"
+        except Exception:
+            logger.exception("Health check: Redis unreachable.")
+            checks["redis"] = "unreachable"
+            healthy = False
+    else:
+        checks["redis"] = "not_configured"
+
+    status_code = 200 if healthy else 503
+    return JSONResponse(
+        status_code=status_code, content={"status": "ok" if healthy else "degraded", "checks": checks}
+    )
 
 
 def build_catalog_text_description(name: str, caption: str, description: str, tags: list[str]) -> str:
@@ -201,13 +289,22 @@ def _matches_from_ranked(ranked: list[dict]) -> list[MatchResult]:
     ]
 
 
-async def _search_image(image: UploadFile, metadata_filter: dict) -> SearchResponse:
+async def _search_image(
+    image: UploadFile, metadata_filter: dict, query_id: str | None = None
+) -> tuple[SearchResponse, dict]:
     """Image-query path: unchanged from before this consolidation pass except
     for the domain gate below -- score >= min_similarity_threshold filter,
     then always reranker.rerank() (no cheap-scoring equivalent exists for
-    judging visual traits against a photo)."""
-    query_id = str(uuid.uuid4())
+    judging visual traits against a photo).
+
+    Returns (response, log_fields) -- log_fields carries path_taken for the
+    structured request-completed log line in search() (see logging_config.py).
+    """
+    query_id = query_id or str(uuid.uuid4())
     raw_bytes = await image.read()
+    # Query representation for search_events (§14/Phase 6) -- a hash, not the
+    # raw bytes, so a jsonb log table never holds actual image data.
+    query_hash = hashlib.sha256(raw_bytes).hexdigest()
     try:
         clean_bytes = prepare_image_bytes(raw_bytes)
     except InvalidImageError as exc:
@@ -219,31 +316,49 @@ async def _search_image(image: UploadFile, metadata_filter: dict) -> SearchRespo
     # cost optimization (rejects obviously irrelevant uploads before spending
     # an embedding call, a Pinecone query, and a potential rerank call).
     if not reranker.is_plausibly_jewelry(clean_bytes):
-        return _not_jewelry_response(query_id)
+        return _not_jewelry_response(query_id), {
+            "path_taken": "domain_gate_rejected", "query_representation": query_hash, "candidates": [],
+        }
 
     query_vector = embeddings.embed_image(clean_bytes)
     raw_matches = vector_db.search(query_vector, metadata_filter=metadata_filter or None)
+    candidates_log = [{"id": m["id"], "score": m["score"]} for m in raw_matches]
 
     strong_matches = [m for m in raw_matches if m["score"] >= settings.min_similarity_threshold]
     if not strong_matches:
-        return SearchResponse(query_id=query_id, matches=[], no_match=True, query_type="image")
+        response = SearchResponse(query_id=query_id, matches=[], no_match=True, query_type="image")
+        return response, {
+            "path_taken": "no_strong_match", "query_representation": query_hash, "candidates": candidates_log,
+        }
 
     ranked = reranker.rerank({"type": "image", "bytes": clean_bytes}, strong_matches)
-    return SearchResponse(
+    response = SearchResponse(
         query_id=query_id, no_match=False, query_type="image", matches=_matches_from_ranked(ranked)
     )
+    return response, {
+        "path_taken": "image_llm_rerank", "query_representation": query_hash, "candidates": candidates_log,
+    }
 
 
-def _search_text(text: str, metadata_filter: dict) -> SearchResponse:
+def _search_text(
+    text: str, metadata_filter: dict, query_id: str | None = None
+) -> tuple[SearchResponse, dict]:
     """Text-query path: no absolute cosine floor (Google's own guidance
     against a fixed cutoff for this model, and cross-modal scores run
     structurally lower than image-vs-image scores -- see config.py). Default
     ranking is score_candidates_cheap() (zero API calls); reranker.rerank()
-    only fires when the cheap-scored top results are genuinely ambiguous."""
-    query_id = str(uuid.uuid4())
+    only fires when the cheap-scored top results are genuinely ambiguous.
+
+    Returns (response, log_fields) -- log_fields carries cache_hit and
+    path_taken for the structured request-completed log line in search()
+    (see logging_config.py).
+    """
+    query_id = query_id or str(uuid.uuid4())
 
     key = cache.cache_key(text, metadata_filter)
-    query_vector = cache._cache.get(key)
+    cached_vector = cache._cache.get(key)
+    cache_hit = cached_vector is not None
+    query_vector = cached_vector
     if query_vector is None:
         query_vector = embeddings.embed_text_query(text)
         cache._cache.set(key, query_vector)
@@ -255,9 +370,13 @@ def _search_text(text: str, metadata_filter: dict) -> SearchResponse:
     # which is the exact bug that silently zeroed out every text search
     # before this fix (see README.md §11).
     if not raw_matches:
-        return SearchResponse(query_id=query_id, matches=[], no_match=True, query_type="text")
+        response = SearchResponse(query_id=query_id, matches=[], no_match=True, query_type="text")
+        return response, {
+            "cache_hit": cache_hit, "path_taken": "empty_result_set", "query_representation": text, "candidates": [],
+        }
 
     candidates = raw_matches[:settings.top_k]
+    candidates_log = [{"id": m["id"], "score": m["score"]} for m in candidates]
     cheap_scored = reranker.score_candidates_cheap(text, candidates)
 
     if len(cheap_scored) >= 3:
@@ -268,13 +387,18 @@ def _search_text(text: str, metadata_filter: dict) -> SearchResponse:
     if gap >= _TEXT_RERANK_GAP_THRESHOLD:
         logger.info("text search: cheap path used (gap=%.3f)", gap)
         ranked = cheap_scored
+        path_taken = "cheap"
     else:
         logger.info("text search: LLM rerank triggered, gap=%.3f", gap)
         ranked = reranker.rerank({"type": "text", "text": text}, candidates)
+        path_taken = "llm_rerank"
 
-    return SearchResponse(
+    response = SearchResponse(
         query_id=query_id, no_match=False, query_type="text", matches=_matches_from_ranked(ranked)
     )
+    return response, {
+        "cache_hit": cache_hit, "path_taken": path_taken, "query_representation": text, "candidates": candidates_log,
+    }
 
 
 @app.post("/api/v1/search", response_model=SearchResponse, dependencies=[])
@@ -294,7 +418,8 @@ async def search(
     default and only escalate to an LLM rerank when results are ambiguous
     (see _search_image / _search_text).
     """
-    require_api_key(x_api_key)
+    client_name, tier = require_api_key(x_api_key)
+    _enforce_rate_limit("search", client_name, tier)
 
     has_image = image is not None
     text = (query_text or "").strip()
@@ -316,29 +441,77 @@ async def search(
             price_filter["$lte"] = max_price
         metadata_filter["price"] = price_filter
 
+    query_id = str(uuid.uuid4())
+    start = time.perf_counter()
     if has_image:
-        return await _search_image(image, metadata_filter)
-    return _search_text(text, metadata_filter)
+        response, log_fields = await _search_image(image, metadata_filter, query_id)
+    else:
+        response, log_fields = _search_text(text, metadata_filter, query_id)
+    latency_ms = round((time.perf_counter() - start) * 1000, 1)
+
+    logger.info(
+        "search request completed",
+        extra={"structured_fields": {
+            "request_id": query_id,
+            "client_name": client_name,
+            "query_type": response.query_type,
+            "no_match": response.no_match,
+            "result_count": len(response.matches),
+            "latency_ms": latency_ms,
+            **log_fields,
+        }},
+    )
+
+    # Best-effort: a Supabase hiccup here must never break a real search --
+    # this is telemetry for future training data (Phase 6), not core
+    # functionality. See search_events.py.
+    try:
+        search_events.record_search_event(
+            request_id=query_id,
+            client_name=client_name,
+            query_type=response.query_type,
+            query_text_or_image_hash=log_fields.get("query_representation", ""),
+            retrieved_candidates=log_fields.get("candidates", []),
+            path_taken=log_fields.get("path_taken", ""),
+            result_ids_returned_in_order=[m.id for m in response.matches],
+            no_match=response.no_match,
+        )
+    except Exception:
+        logger.exception("Failed to record search event for request_id=%s.", query_id)
+        sentry_sdk.capture_exception()
+
+    return response
 
 
-# job_id -> {"status", "total", "processed", "failed_items"}. In-memory and
-# process-local — fine for a single dev/admin backend instance, but move this
-# to Redis/a DB before running more than one worker process, since a second
-# instance (or a restart) won't see jobs recorded by another.
-_jobs: dict[str, dict] = {}
+@app.post("/api/v1/search/{query_id}/feedback", status_code=204)
+def submit_search_feedback(
+    query_id: str, feedback: FeedbackRequest, x_api_key: Optional[str] = Header(None)
+):
+    """
+    Records client-reported feedback on a specific search result (clicked /
+    purchased / dismissed) -- ground truth for the future ranking work
+    search_events.py's data collection exists to support (§14/Phase 6).
+    Frontend integration is a stretch goal, not required this phase; the
+    endpoint and its table exist now so it's ready the moment that lands.
+    """
+    require_api_key(x_api_key)
+    search_events.record_feedback(query_id, feedback.result_id, feedback.action)
+    return Response(status_code=204)
 
 
 async def _index_job(job_id: str, items_payload: list[dict]):
     """Background task: embed + upsert catalog items one at a time, updating
-    _jobs[job_id] as it goes so GET /api/v1/catalog/jobs/{job_id} can report
-    live progress.
+    the job_store entry as it goes so GET /api/v1/catalog/jobs/{job_id} can
+    report live progress (see job_store.py -- Redis-backed when REDIS_URL is
+    set, so progress is visible across instances/restarts, not just to the
+    process that started the job).
 
     Each item is wrapped in its own try/except: one bad image (corrupt file,
     a transient embedding-API failure that exhausts retries, ...) is recorded
     as a failure for that item_id and the batch continues, rather than one
     bad item aborting everything else the admin uploaded alongside it.
     """
-    job = _jobs[job_id]
+    job = job_store._job_store.get(job_id)
     for item in items_payload:
         meta: IndexItemMetadata = item["meta"]
         try:
@@ -348,8 +521,7 @@ async def _index_job(job_id: str, items_payload: list[dict]):
             )
             vector = embeddings.embed_catalog_item(clean_bytes, text_description)
 
-            image_path = CATALOG_IMAGE_DIR / f"{meta.item_id}.jpg"
-            image_path.write_bytes(clean_bytes)
+            image_url = object_storage.upload_catalog_image(meta.item_id, clean_bytes)
 
             metadata = {
                 "filename": item["filename"],
@@ -359,7 +531,7 @@ async def _index_job(job_id: str, items_payload: list[dict]):
                 "tags": meta.tags,
                 "category": meta.category,
                 "price": meta.price,
-                "image_url": f"/static/catalog/{meta.item_id}.jpg",
+                "image_url": image_url,
             }
             if meta.material:
                 metadata["material"] = meta.material
@@ -368,11 +540,14 @@ async def _index_job(job_id: str, items_payload: list[dict]):
             catalog_store.record_item(meta.item_id, metadata)
         except Exception as exc:
             logger.exception("Failed to index catalog item %s.", meta.item_id)
+            sentry_sdk.capture_exception(exc)
             job["failed_items"].append({"item_id": meta.item_id, "error": str(exc)})
         finally:
             job["processed"] += 1
+            job_store._job_store.set(job_id, job)
 
     job["status"] = "failed" if len(job["failed_items"]) == job["total"] else "done"
+    job_store._job_store.set(job_id, job)
 
 
 @app.post("/api/v1/catalog/index", response_model=IndexResponse)
@@ -390,7 +565,8 @@ async def index_catalog(
     items_json is a JSON array of per-item metadata objects (see
     IndexItemMetadata), positionally aligned 1:1 with the `images` list.
     """
-    require_api_key(x_api_key)
+    client_name, tier = require_api_key(x_api_key)
+    _enforce_rate_limit("index", client_name, tier)
 
     try:
         raw_items = json.loads(items_json)
@@ -428,7 +604,9 @@ async def index_catalog(
         items_payload.append({"raw_bytes": raw_bytes, "filename": img.filename, "meta": meta})
 
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"status": "pending", "total": len(items_payload), "processed": 0, "failed_items": []}
+    job_store._job_store.set(
+        job_id, {"status": "pending", "total": len(items_payload), "processed": 0, "failed_items": []}
+    )
     background_tasks.add_task(_index_job, job_id, items_payload)
 
     return IndexResponse(indexed_count=len(items_payload), job_id=job_id)
@@ -437,7 +615,7 @@ async def index_catalog(
 @app.get("/api/v1/catalog/jobs/{job_id}", response_model=JobStatus)
 def get_job_status(job_id: str, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-    job = _jobs.get(job_id)
+    job = job_store._job_store.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Unknown job_id.")
     return JobStatus(job_id=job_id, **job)
@@ -519,10 +697,8 @@ async def update_catalog_item(
             edited.name, edited.caption, edited.description, edited.tags
         )
         vector = embeddings.embed_catalog_item(clean_bytes, text_description)
-        image_path = CATALOG_IMAGE_DIR / f"{item_id}.jpg"
-        image_path.write_bytes(clean_bytes)
         metadata["filename"] = image.filename
-        metadata["image_url"] = f"/static/catalog/{item_id}.jpg"
+        metadata["image_url"] = object_storage.upload_catalog_image(item_id, clean_bytes)
         vector_db.upsert_batch([{"id": item_id, "vector": vector, "metadata": metadata}])
     else:
         vector_db.update_metadata(item_id, metadata)
@@ -541,9 +717,6 @@ def delete_catalog_item(item_id: str, x_api_key: Optional[str] = Header(None)):
 
     vector_db.delete_by_id(item_id)
     catalog_store.delete_item(item_id)
-
-    image_path = CATALOG_IMAGE_DIR / f"{item_id}.jpg"
-    if image_path.exists():
-        image_path.unlink()
+    object_storage.delete_catalog_image(item_id)
 
     return Response(status_code=204)

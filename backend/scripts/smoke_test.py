@@ -40,6 +40,13 @@ os.environ.setdefault("APP_API_KEY", "smoke-test-key")
 os.environ.setdefault("ALLOWED_ORIGINS", "http://localhost:5173")
 os.environ.setdefault("SUPABASE_URL", "https://fake-project.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_KEY", "fake-supabase-service-key")
+# object_storage.py builds a boto3 client at import time and validates its
+# endpoint URL immediately -- same rationale as conftest.py's R2_* defaults.
+os.environ.setdefault("R2_ACCOUNT_ID", "fake-account-id")
+os.environ.setdefault("R2_ACCESS_KEY_ID", "fake-access-key-id")
+os.environ.setdefault("R2_SECRET_ACCESS_KEY", "fake-secret-access-key")
+os.environ.setdefault("R2_BUCKET_NAME", "smoke-test-catalog")
+os.environ.setdefault("R2_PUBLIC_URL_BASE", "https://pub-fake.r2.dev")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -206,12 +213,12 @@ async def main_() -> int:
         # customer photo of the same item under different lighting/angle.
         query_raw = _make_jpeg_bytes((210, 35, 25), shape="circle")
         upload = UploadFile(file=io.BytesIO(query_raw), filename="query.jpg")
-        image_resp = await main._search_image(upload, {})
+        image_resp, _ = await main._search_image(upload, {})
         _print_response("Image search results:", image_resp)
 
         print("\n--- Text search: well-separated query (expect cheap path, zero LLM calls) ---")
         before = _fake_generate_content_calls()
-        separated_resp = main._search_text("a blue gemstone necklace", {})
+        separated_resp, _ = main._search_text("a blue gemstone necklace", {})
         separated_gen_calls = _fake_generate_content_calls() - before
         _print_response('Text search ("a blue gemstone necklace") results:', separated_resp)
         print(f"  generate_content calls during this search: {separated_gen_calls} "
@@ -226,7 +233,7 @@ async def main_() -> int:
 
         print("\n--- Text search: ambiguous query (expect LLM rerank to fire) ---")
         before = _fake_generate_content_calls()
-        ambiguous_resp = main._search_text("a green gemstone earring", {})
+        ambiguous_resp, _ = main._search_text("a green gemstone earring", {})
         ambiguous_gen_calls = _fake_generate_content_calls() - before
         _print_response('Text search ("a green gemstone earring") results:', ambiguous_resp)
         print(f"  generate_content calls during this search: {ambiguous_gen_calls} "

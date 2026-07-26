@@ -80,6 +80,16 @@ class RedisCache(SearchCache):
         self._client.set(key, json.dumps(vector), ex=ttl_seconds)
 
 
+def ping() -> None:
+    """Cheap Redis reachability check for GET /health. No-op if REDIS_URL
+    isn't set (InMemoryCache is in use, not a failure state -- see main.py's
+    /health, which reports this as "not_configured" rather than "down").
+    Raises on failure when Redis IS configured; callers decide how to
+    report that."""
+    if isinstance(_cache, RedisCache):
+        _cache._client.ping()
+
+
 def cache_key(query_text: str, filters: dict) -> str:
     normalized = query_text.strip().lower()
     payload = f"{normalized}:{json.dumps(filters, sort_keys=True)}"

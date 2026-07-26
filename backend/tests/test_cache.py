@@ -1,3 +1,5 @@
+import pytest
+
 import cache
 
 
@@ -84,6 +86,31 @@ def test_redis_cache_set_serializes_json_with_ttl(mocker):
     c.set("key-1", [0.1, 0.2], ttl_seconds=120)
 
     mock_set.assert_called_once_with("key-1", "[0.1, 0.2]", ex=120)
+
+
+def test_ping_no_op_when_in_memory_cache_in_use(mocker):
+    mocker.patch.object(cache, "_cache", cache.InMemoryCache())
+
+    cache.ping()  # should not raise -- nothing to ping
+
+
+def test_ping_calls_redis_client_ping_when_redis_cache_in_use(mocker):
+    redis_cache = cache.RedisCache("redis://fake")
+    mocker.patch.object(cache, "_cache", redis_cache)
+    mock_ping = mocker.patch.object(redis_cache._client, "ping")
+
+    cache.ping()
+
+    mock_ping.assert_called_once()
+
+
+def test_ping_propagates_failure_when_redis_unreachable(mocker):
+    redis_cache = cache.RedisCache("redis://fake")
+    mocker.patch.object(cache, "_cache", redis_cache)
+    mocker.patch.object(redis_cache._client, "ping", side_effect=Exception("down"))
+
+    with pytest.raises(Exception, match="down"):
+        cache.ping()
 
 
 def test_make_cache_uses_redis_when_url_configured(mocker):
